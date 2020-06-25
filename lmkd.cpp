@@ -2753,6 +2753,57 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermark
     }
 }
 
+static void log_zone_watermarks(struct zoneinfo *zi,
+                                struct zone_watermarks *wmarks) {
+    int i, j;
+    struct zoneinfo_node *node;
+    union zoneinfo_zone_fields *zone_fields;
+
+    for (i = 0; i < zi->node_count; i++) {
+        node = &zi->nodes[i];
+
+        for (j = 0; j < node->zone_count; j++) {
+            zone_fields = &node->zones[j].fields;
+
+            ULMK_LOG(D, "Zone: %u nr_free_pages: %ld min: %ld low: %ld "
+                     "high: %ld present: %ld nr_cma_free: %ld "
+                     "max_protection: %ld", j, zone_fields->field.nr_free_pages,
+                     zone_fields->field.min, zone_fields->field.low,
+                     zone_fields->field.high, zone_fields->field.present,
+                     zone_fields->field.nr_free_cma,
+                     node->zones[j].max_protection);
+        }
+    }
+
+    ULMK_LOG(D, "Aggregate wmarks: min: %ld low: %ld high %ld",
+             wmarks->min_wmark, wmarks->low_wmark, wmarks->high_wmark);
+}
+
+static void log_meminfo(union meminfo *mi, enum zone_watermark wmark)
+{
+    char wmark_str[LINE_MAX];
+
+    if (wmark == WMARK_MIN) {
+        strlcpy(wmark_str, "min", LINE_MAX);
+    } else if (wmark == WMARK_LOW) {
+        strlcpy(wmark_str, "low", LINE_MAX);
+    } else if (wmark == WMARK_HIGH) {
+        strlcpy(wmark_str, "high", LINE_MAX);
+    } else {
+        strlcpy(wmark_str, "none", LINE_MAX);
+    }
+
+    ULMK_LOG(D, "smallest wmark breached: %s nr_free_pages: %ld "
+             "active_anon: %ld inactive_anon: %ld cma_free: %ld", wmark_str,
+             mi->field.nr_free_pages, mi->field.active_anon,
+             mi->field.inactive_anon, mi->field.cma_free);
+}
+
+static int64_t calc_growth(int64_t new_sample_val, int64_t old_sample_val)
+{
+    return ((new_sample_val - old_sample_val) * 100) / (old_sample_val + 1);
+}
+
 static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_params) {
     enum kill_reasons {
         NONE = -1, /* To denote no kill condition */
@@ -2773,6 +2824,10 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     static int64_t base_file_lru;
     static int64_t init_pgscan_kswapd;
     static int64_t init_pgscan_direct;
+    static int64_t init_pgskip_dma;
+    static int64_t init_pgskip_normal;
+    static int64_t init_pgskip_high;
+    static int64_t init_pgskip_movable;
     static int64_t swap_low_threshold;
     static bool killing;
     static int thrashing_limit;
@@ -2795,6 +2850,9 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     bool cut_thrashing_limit = false;
     int min_score_adj = 0;
 
+    ULMK_LOG(D, "%s pressure event %s", level_name[level], events ?
+             "triggered" : "polling check");
+
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
         return;
@@ -2812,6 +2870,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (kill_pending && (kill_timeout_ms == 0 ||
         get_time_diff_ms(&last_kill_tm, &curr_tm) < static_cast<long>(kill_timeout_ms))) {
         /* Skip while still killing a process */
+        ULMK_LOG(D, "Ignoring %s pressure event; kill already in progress",
+                 level_name[level]);
         goto no_kill;
     }
     /*
@@ -2837,7 +2897,30 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         /* Reset file-backed pagecache size and refault amounts after a kill */
         base_file_lru = vs.field.nr_inactive_file + vs.field.nr_active_file;
         init_ws_refault = vs.field.workingset_refault;
+        init_pgskip_dma = vs.field.pgskip_dma;
+        init_pgskip_normal = vs.field.pgskip_normal;
+        init_pgskip_high = vs.field.pgskip_high;
+        init_pgskip_movable = vs.field.pgskip_movable;
     }
+
+    ULMK_LOG(D, "nr_free_pages: %ld nr_inactive_file: %ld nr_active_file: %ld "
+	     "workingset_refault: %ld pgscan_kswapd: %ld pgscan_direct: %ld "
+             "pgscan_direct_throttle: %ld init_pgscan_direct: %ld "
+             "init_pgscan_kswapd: %ld base_file_lru: %ld init_ws_refault: %ld "
+             "free_swap: %ld total_swap: %ld swap_free_percentage: %ld%% "
+             "pgskip_dma_growth: %ld%% pgskip_normal_growth: %ld%% "
+             "pgskip_high_growth: %ld%% pgskip_movable: %ld%%",
+             vs.field.nr_free_pages, vs.field.nr_inactive_file,
+             vs.field.nr_active_file, vs.field.workingset_refault,
+             vs.field.pgscan_kswapd, vs.field.pgscan_direct,
+             vs.field.pgscan_direct_throttle, init_pgscan_direct,
+             init_pgscan_kswapd, base_file_lru, init_ws_refault,
+             mi.field.free_swap, mi.field.total_swap,
+             (mi.field.free_swap * 100) / (mi.field.total_swap + 1),
+             calc_growth(vs.field.pgskip_dma, init_pgskip_dma),
+             calc_growth(vs.field.pgskip_normal, init_pgskip_normal),
+             calc_growth(vs.field.pgskip_high, init_pgskip_high),
+             calc_growth(vs.field.pgskip_movable, init_pgskip_movable));
 
     /* Check free swap levels */
     if (swap_free_low_percentage) {
@@ -2864,6 +2947,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             last_pa_update_tm = curr_tm;
         }
         /* Skip if system is not reclaiming */
+        ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim",
+                 level_name[level]);
         goto no_kill;
     }
 
@@ -2872,9 +2957,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         base_file_lru = vs.field.nr_inactive_file + vs.field.nr_active_file;
         init_ws_refault = vs.field.workingset_refault;
         thrashing_limit = thrashing_limit_pct;
+        init_pgskip_dma = vs.field.pgskip_dma;
+        init_pgskip_normal = vs.field.pgskip_normal;
+        init_pgskip_high = vs.field.pgskip_high;
+        init_pgskip_movable = vs.field.pgskip_movable;
     } else {
         /* Calculate what % of the file-backed pagecache refaulted so far */
         thrashing = (vs.field.workingset_refault - init_ws_refault) * 100 / base_file_lru;
+        ULMK_LOG(D, "thrashing: %ld%% thrashing_limit: %d%%", thrashing,
+                 thrashing_limit);
     }
     in_reclaim = true;
 
@@ -2891,12 +2982,16 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             return;
         }
 
+
         calc_zone_watermarks(&zi, &watermarks);
+        log_zone_watermarks(&zi, &watermarks);
+
         wmark_update_tm = curr_tm;
      }
 
     /* Find out which watermark is breached if any */
     wmark = get_lowest_watermark(&mi, &watermarks);
+    log_meminfo(&mi, wmark);
 
     /*
      * TODO: move this logic into a separate function
@@ -2969,7 +3064,13 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
                  */
                 thrashing_limit = (thrashing_limit * (100 - thrashing_limit_decay_pct)) / 100;
             }
+        } else {
+            ULMK_LOG(D, "No processes to kill with adj score >= %d",
+                     min_score_adj);
         }
+    } else {
+        ULMK_LOG(D, "Not killing for %s pressure event %s", level_name[level],
+                 events ? "trigger" : "polling check");
     }
 
 no_kill:
