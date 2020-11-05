@@ -2745,20 +2745,26 @@ enum zone_watermark {
 };
 
 struct zone_watermarks {
-    int64_t nr_free_pages;
-    int64_t cma_free;
     long high_wmark;
     long low_wmark;
     long min_wmark;
+};
+
+struct zone_meminfo {
+    int64_t nr_free_pages;
+    int64_t cma_free;
+    struct zone_watermarks watermarks;
+
 };
 
 /*
  * Returns lowest breached watermark or WMARK_NONE.
  */
 static enum zone_watermark get_lowest_watermark(union meminfo *mi __unused,
-                                                struct zone_watermarks *watermarks)
+                                                struct zone_meminfo *zmi)
 {
-    int64_t nr_free_pages = watermarks->nr_free_pages - watermarks->cma_free;
+    struct zone_watermarks *watermarks = &zmi->watermarks;
+    int64_t nr_free_pages = zmi->nr_free_pages - zmi->cma_free;
 
     if (nr_free_pages < watermarks->min_wmark) {
         return WMARK_MIN;
@@ -2803,8 +2809,11 @@ static void log_zone_watermarks(struct zoneinfo *zi,
     }
 }
 
-void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermarks, int64_t *pgskip_deltas) {
-    memset(watermarks, 0, sizeof(struct zone_watermarks));
+void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t *pgskip_deltas) {
+    struct zone_watermarks *watermarks;
+
+    memset(zmi, 0, sizeof(struct zone_meminfo));
+    watermarks = &zmi->watermarks;
 
     for (int node_idx = 0; node_idx < zi->node_count; node_idx++) {
         struct zoneinfo_node *node = &zi->nodes[node_idx];
@@ -2820,8 +2829,8 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermark
             }
 
 	    if (!pgskip_deltas[PGSKIP_IDX(i++)]) {
-		    watermarks->nr_free_pages += zone->fields.field.nr_free_pages;
-		    watermarks->cma_free += zone->fields.field.nr_free_cma;
+		    zmi->nr_free_pages += zone->fields.field.nr_free_pages;
+		    zmi->cma_free += zone->fields.field.nr_free_cma;
 	            watermarks->high_wmark += zone->max_protection + zone->fields.field.high;
 		    watermarks->low_wmark += zone->max_protection + zone->fields.field.low;
 	            watermarks->min_wmark += zone->max_protection + zone->fields.field.min;
@@ -2855,7 +2864,7 @@ static void log_meminfo(union meminfo *mi, enum zone_watermark wmark)
     }
 }
 
-static void fill_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_t *pgskip_deltas)
+static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_t *pgskip_deltas)
 {
     unsigned int i;
 
@@ -2867,11 +2876,6 @@ static void fill_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_t *p
 		pgskip_deltas[PGSKIP_IDX(i)] = -1;
 	}
     }
-
-}
-
-static void log_pgskip_stats(int64_t *pgskip_deltas)
-{
 
     if (debug_process_killing) {
         ULMK_LOG(D, "pgskip deltas: DMA: %" PRId64 " Normal: %" PRId64 " High: %"
@@ -2912,7 +2916,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     static bool killing;
     static int thrashing_limit;
     static bool in_reclaim;
-    static struct zone_watermarks watermarks;
+    static struct zone_meminfo zone_mem_info;
     static struct timespec last_pa_update_tm;
     static int64_t init_compact_stall;
 
@@ -2999,8 +3003,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
              mi.field.free_swap, mi.field.total_swap,
              (mi.field.free_swap * 100) / (mi.field.total_swap + 1));
     }
-    fill_pgskip_stats(&vs, init_pgskip, pgskip_deltas);
-    log_pgskip_stats(pgskip_deltas);
+    fill_log_pgskip_stats(&vs, init_pgskip, pgskip_deltas);
 
     /* Check free swap levels */
     if (swap_free_low_percentage) {
@@ -3068,10 +3071,10 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         return;
     }
 
-    calc_zone_watermarks(&zi, &watermarks, pgskip_deltas);
+    calc_zone_watermarks(&zi, &zone_mem_info, pgskip_deltas);
 
     /* Find out which watermark is breached if any */
-    wmark = get_lowest_watermark(&mi, &watermarks);
+    wmark = get_lowest_watermark(&mi, &zone_mem_info);
     log_meminfo(&mi, wmark);
     if (level < VMPRESS_LEVEL_CRITICAL && (reclaim == DIRECT_RECLAIM ||
 			reclaim == DIRECT_RECLAIM_THROTTLE))
@@ -3091,7 +3094,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         strlcpy(kill_desc, "min watermark is breached even after kill", sizeof(kill_desc));
     } else if (reclaim == DIRECT_RECLAIM_THROTTLE) {
 	kill_reason = DIRECT_RECL_AND_THROT;
-	strlcpy(kill_desc, "system processes are in throttle", sizeof(kill_desc));
+	strlcpy(kill_desc, "system processes are being throttled", sizeof(kill_desc));
     } else if (level >= VMPRESS_LEVEL_CRITICAL && (events != 0 || wmark <= WMARK_HIGH)) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
