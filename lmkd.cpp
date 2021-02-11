@@ -892,8 +892,18 @@ static void poll_kernel(int poll_fd) {
             ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid);
             mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
             mem_st.rss_in_bytes = rss_in_pages * PAGE_SIZE;
-            stats_write_lmk_kill_occurred_pid(uid, pid, oom_score_adj,
-                                              min_score_adj, 0, &mem_st);
+
+            struct kill_stat kill_st = {
+                .uid = static_cast<int32_t>(uid),
+                .kill_reason = NONE,
+                .oom_score = oom_score_adj,
+                .min_oom_score = min_score_adj,
+                .free_mem_kb = 0,
+                .free_swap_kb = 0,
+                .tasksize = 0,
+
+            };
+            stats_write_lmk_kill_occurred_pid(pid, &kill_st, &mem_st);
         }
 
         free(taskname);
@@ -2601,7 +2611,7 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
 }
 
 /* Kill one process specified by procp.  Returns the size of the process killed */
-static int kill_one_process(struct proc* procp, int min_oom_score, int kill_reason,
+static int kill_one_process(struct proc* procp, int min_oom_score, enum kill_reasons kill_reason,
                             const char *kill_desc, union meminfo *mi, struct wakeup_info *wi,
                             struct timespec *tm) {
     int pid = procp->pid;
@@ -2614,6 +2624,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, int kill_reas
     int result = -1;
     struct memory_stat *mem_st;
     char buf[LINE_MAX];
+    struct kill_stat kill_st;
 
     tgid = proc_get_tgid(pid);
     if (tgid >= 0 && tgid != pid) {
@@ -2669,7 +2680,15 @@ static int kill_one_process(struct proc* procp, int min_oom_score, int kill_reas
               uid, procp->oomadj, tasksize * page_k);
     }
 
-    stats_write_lmk_kill_occurred(uid, taskname, procp->oomadj, min_oom_score, tasksize, mem_st);
+    kill_st.uid = static_cast<int32_t>(uid);
+    kill_st.taskname = taskname;
+    kill_st.kill_reason = kill_reason;
+    kill_st.oom_score = procp->oomadj;
+    kill_st.min_oom_score = min_oom_score;
+    kill_st.free_mem_kb = mi->field.nr_free_pages * page_k;
+    kill_st.free_swap_kb = mi->field.free_swap * page_k;
+    kill_st.tasksize = tasksize;
+    stats_write_lmk_kill_occurred(&kill_st, mem_st);
 
     ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid);
 
@@ -2688,8 +2707,9 @@ out:
  * Find one process to kill at or above the given oom_adj level.
  * Returns size of the killed process.
  */
-static int find_and_kill_process(int min_score_adj, int kill_reason, const char *kill_desc,
-                                 union meminfo *mi, struct wakeup_info *wi, struct timespec *tm) {
+static int find_and_kill_process(int min_score_adj, enum kill_reasons kill_reason,
+                                 const char *kill_desc, union meminfo *mi,
+                                 struct wakeup_info *wi, struct timespec *tm) {
     int i;
     int killed_size = 0;
     bool can_retry = true;
@@ -2872,6 +2892,7 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
 
     memset(zmi, 0, sizeof(struct zone_meminfo));
     watermarks = &zmi->watermarks;
+    memset(watermarks, 0, sizeof(struct zone_watermarks));
 
     for (int node_idx = 0; node_idx < zi->node_count; node_idx++) {
         struct zoneinfo_node *node = &zi->nodes[node_idx];
@@ -2946,19 +2967,6 @@ static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_
 }
 
 static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_params) {
-    enum kill_reasons {
-        NONE = -1, /* To denote no kill condition */
-        PRESSURE_AFTER_KILL = 0,
-        CRITICAL_KILL,
-        LOW_SWAP_AND_THRASHING,
-        LOW_MEM_AND_SWAP,
-        LOW_MEM_AND_THRASHING,
-        DIRECT_RECL_AND_THRASHING,
-        DIRECT_RECL_AND_THROT,
-        DIRECT_RECL_AND_LOW_MEM,
-        COMPACTION,
-        KILL_REASON_COUNT
-    };
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
@@ -2975,12 +2983,12 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     static int64_t swap_low_threshold;
     static bool killing;
     static int thrashing_limit = thrashing_limit_pct;
-    static struct zone_meminfo zone_mem_info;
-    static struct timespec last_pa_update_tm;
-    static int64_t init_compact_stall;
     static struct wakeup_info wi;
     static struct timespec thrashing_reset_tm;
     static int64_t prev_thrash_growth = 0;
+    static struct zone_meminfo zone_mem_info;
+    static struct timespec last_pa_update_tm;
+    static int64_t init_compact_stall;
 
     union meminfo mi;
     union vmstat vs;
@@ -2996,8 +3004,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     bool cut_thrashing_limit = false;
     unsigned int i;
     int min_score_adj = 0;
-    bool in_compaction = false;
     long since_thrashing_reset_ms;
+    bool in_compaction = false;
     int64_t pgskip_deltas[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1] = {0};
     struct zoneinfo zi;
 
@@ -3005,14 +3013,16 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
              "triggered" : "polling check");
 
     if (events &&
-       (!poll_params->poll_handler || data >= poll_params->poll_handler->data)) {
-           wbf_effective = wmark_boost_factor;
+        (!poll_params->poll_handler || data >= poll_params->poll_handler->data)) {
+            wbf_effective = wmark_boost_factor;
     }
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
         return;
     }
+
+    record_wakeup_time(&curr_tm, events ? Event : Polling, &wi);
 
     if (level == VMPRESS_LEVEL_LOW) {
         if (enable_preferred_apps &&
@@ -3021,7 +3031,6 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             last_pa_update_tm = curr_tm;
         }
     }
-    record_wakeup_time(&curr_tm, events ? Event : Polling, &wi);
 
     bool kill_pending = is_kill_pending();
     if (kill_pending && (kill_timeout_ms == 0 ||
@@ -3108,6 +3117,9 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         }
         reclaim = KSWAPD_RECLAIM;
     } else if (vs.field.workingset_refault == prev_workingset_refault) {
+        /* Device is not thrashing and not reclaiming, bail out early until we see these stats changing*/
+        goto no_kill;
+    } else {
         if (enable_preferred_apps &&
                 (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
             perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
@@ -3115,13 +3127,12 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         }
 
         if (!in_compaction) {
+            /* Skip if system is not reclaiming */
             ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim",
                      level_name[level]);
-            /* Device is not thrashing and not reclaiming, bail out early until we see these stats changing*/
             goto no_kill;
         }
     }
-
 
     prev_workingset_refault = vs.field.workingset_refault;
 
@@ -3594,7 +3605,7 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 do_kill:
     if (low_ram_device && per_app_memcg) {
         /* For Go devices kill only one task */
-        if (find_and_kill_process(level_oomadj[level], -1, NULL, &mi, &wi, &curr_tm) == 0) {
+        if (find_and_kill_process(level_oomadj[level], NONE, NULL, &mi, &wi, &curr_tm) == 0) {
             if (debug_process_killing) {
                 ALOGI("Nothing to kill");
             }
@@ -3626,7 +3637,7 @@ do_kill:
             }
         }
 
-        pages_freed = find_and_kill_process(min_score_adj, -1, NULL, &mi, &wi, &curr_tm);
+        pages_freed = find_and_kill_process(min_score_adj, NONE, NULL, &mi, &wi, &curr_tm);
 
         if (pages_freed == 0) {
             /* Rate limit kill reports when nothing was reclaimed */
