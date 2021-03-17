@@ -87,7 +87,6 @@
 #define MEMINFO_PATH "/proc/meminfo"
 #define VMSTAT_PATH "/proc/vmstat"
 #define PROC_STATUS_TGID_FIELD "Tgid:"
-#define TRACE_MARKER_PATH "/sys/kernel/debug/tracing/trace_marker"
 #define LINE_MAX 128
 #define MAX_NR_ZONES 6
 
@@ -2151,43 +2150,8 @@ static int parse_one_zone_watermark(char *buf, struct watermark_info *w)
     return ret;
 }
 
-static void trace_log(const char *fmt, ...)
-{
-    char buf[PAGE_SIZE];
-    va_list ap;
-    static int fd = -1;
-    ssize_t len, ret;
-
-    if (fd < 0) {
-        fd = open(TRACE_MARKER_PATH, O_WRONLY | O_CLOEXEC);
-        if (fd < 0) {
-            ALOGE("Error opening " TRACE_MARKER_PATH "; errno=%d",
-                errno);
-            return;
-        }
-    }
-
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-
-    len = strlen(buf);
-    ret = TEMP_FAILURE_RETRY(write(fd, buf, len));
-    if (ret < 0) {
-        if (errno != EBADF) {
-            ALOGE("Error writing " TRACE_MARKER_PATH ";errno=%d", errno);
-            close(fd);
-            fd = -1;
-        }
-        return;
-    } else if (ret < len) {
-        ALOGE("Short write on " TRACE_MARKER_PATH "; length=%zd", ret);
-    }
-}
-
 #define ULMK_LOG(X, fmt...) ({ \
     ALOG##X(fmt);              \
-    trace_log(fmt);            \
 })
 
 static int file_cache_to_adj(enum vmpressure_level __unused lvl, int nr_free,
