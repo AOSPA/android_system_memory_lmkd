@@ -86,6 +86,24 @@
       "parentUuid": "d21c505f_c663ac25",
       "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
       "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "1017451a_dfd5834a",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000469
+      },
+      "writtenOn": "2021-05-14T16:17:59Z",
+      "side": 1,
+      "message": "Simply git revert wouldnt work since CAF has added plenty more ULMK_LOG since this commit. I could just replace them all with ALOG manually but that could lead to merge conflicts in future",
+      "parentUuid": "a5fc18c7_b76d2193",
+      "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
+      "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
     }
   ]
 }
