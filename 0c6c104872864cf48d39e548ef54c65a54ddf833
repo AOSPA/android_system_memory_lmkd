@@ -51,6 +51,41 @@
       "parentUuid": "606449d1_2b28bce0",
       "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
       "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "e4c3a674_d2cb7a2e",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000488
+      },
+      "writtenOn": "2021-05-14T16:03:52Z",
+      "side": 1,
+      "message": "Comment removed by: Vishal Cj; Reason: typo",
+      "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
+      "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "a5fc18c7_b76d2193",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000488
+      },
+      "writtenOn": "2021-05-14T16:03:52Z",
+      "side": 1,
+      "message": "well i would rather revert the whole thing then. \nHere is the commit :- https://source.codeaurora.org/quic/la/platform/system/memory/lmkd/commit/lmkd.cpp?h\u003dLA.QSSI.11.0.r1-11900-qssi.0\u0026id\u003de74f8a4bb3300425068152aa788166d6efaa4307\n\nAccording to the CR of the above linked commit, CAF just mentioned this:\n\u0027Add extra debug logs for LMKD\u0027\n\nAlso, AOSP doesnt add such tracing, so i think it\u0027s safe to revert.",
+      "parentUuid": "d21c505f_c663ac25",
+      "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
+      "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
     }
   ]
 }
