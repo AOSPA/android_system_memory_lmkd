@@ -33,6 +33,24 @@
       "message": "Even if its not supported it should fail gracefully no?",
       "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
       "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "d21c505f_c663ac25",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000469
+      },
+      "writtenOn": "2021-05-14T14:14:11Z",
+      "side": 1,
+      "message": "It spams log quite often and I don\u0027t think thats graceful. Perhaps ALOGE can be changed to ALOGD or ALOGV but I\u0027m in favour of removing the tracing altogether since its of no use.",
+      "parentUuid": "606449d1_2b28bce0",
+      "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
+      "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
     }
   ]
 }
