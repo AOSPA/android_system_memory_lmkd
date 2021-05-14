@@ -104,6 +104,24 @@
       "parentUuid": "a5fc18c7_b76d2193",
       "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
       "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
+    },
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "8e995538_8c35627b",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000488
+      },
+      "writtenOn": "2021-05-14T16:22:57Z",
+      "side": 1,
+      "message": "I am fine with the commit you have in place right now. Jake would also be okay with it, please ask him before",
+      "parentUuid": "1017451a_dfd5834a",
+      "revId": "0c6c104872864cf48d39e548ef54c65a54ddf833",
+      "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
     }
   ]
 }
