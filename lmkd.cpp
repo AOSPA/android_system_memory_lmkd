@@ -43,7 +43,6 @@
 #include <unistd.h>
 
 #include <cutils/properties.h>
-#include <cutils/sched_policy.h>
 #include <cutils/sockets.h>
 #include <liblmkd_utils.h>
 #include <lmkd.h>
@@ -51,6 +50,7 @@
 #include <log/log_event_list.h>
 #include <log/log_time.h>
 #include <private/android_filesystem_config.h>
+#include <processgroup/processgroup.h>
 #include <psi/psi.h>
 #include <system/thread_defs.h>
 #include <dlfcn.h>
@@ -127,6 +127,16 @@ static inline void trace_kill_end() {}
 
 #define STRINGIFY(x) STRINGIFY_INTERNAL(x)
 #define STRINGIFY_INTERNAL(x) #x
+
+/*
+ * Read lmk property with persist.device_config.lmkd_native.<name> overriding ro.lmk.<name>
+ * persist.device_config.lmkd_native.* properties are being set by experiments. If a new property
+ * can be controlled by an experiment then use GET_LMK_PROPERTY instead of property_get_xxx and
+ * add "on property" triggers in lmkd.rc to react to the experiment flag changes.
+ */
+#define GET_LMK_PROPERTY(type, name, def) \
+    property_get_##type("persist.device_config.lmkd_native." name, \
+        property_get_##type("ro.lmk." name, def))
 
 /*
  * PSI monitor tracking window size.
@@ -2121,8 +2131,15 @@ static void record_wakeup_time(struct timespec *tm, enum wakeup_reason reason,
     }
 }
 
+struct kill_info {
+    enum kill_reasons kill_reason;
+    const char *kill_desc;
+    int thrashing;
+    int max_thrashing;
+};
+
 static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
-                         int swap_kb, int kill_reason, union meminfo *mi,
+                         int swap_kb, struct kill_info *ki, union meminfo *mi,
                          struct wakeup_info *wi, struct timespec *tm) {
     /* log process information */
     android_log_write_int32(ctx, procp->pid);
@@ -2130,7 +2147,7 @@ static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
     android_log_write_int32(ctx, procp->oomadj);
     android_log_write_int32(ctx, min_oom_score);
     android_log_write_int32(ctx, (int32_t)min(rss_kb, INT32_MAX));
-    android_log_write_int32(ctx, kill_reason);
+    android_log_write_int32(ctx, ki ? ki->kill_reason : NONE);
 
     /* log meminfo fields */
     for (int field_idx = 0; field_idx < MI_FIELD_COUNT; field_idx++) {
@@ -2144,6 +2161,13 @@ static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
     android_log_write_int32(ctx, wi->skipped_wakeups);
     android_log_write_int32(ctx, (int32_t)min(swap_kb, INT32_MAX));
     android_log_write_int32(ctx, (int32_t)mi->field.total_gpu_kb);
+    if (ki) {
+        android_log_write_int32(ctx, ki->thrashing);
+        android_log_write_int32(ctx, ki->max_thrashing);
+    } else {
+        android_log_write_int32(ctx, 0);
+        android_log_write_int32(ctx, 0);
+    }
 
     android_log_write_list(ctx, LOG_ID_EVENTS);
     android_log_reset(ctx);
@@ -2475,7 +2499,8 @@ static struct proc *proc_get_heaviest(int oomadj) {
     }
 }
 
-static void set_process_group_and_prio(int pid, SchedPolicy sp, int prio) {
+static void set_process_group_and_prio(int pid, const std::vector<std::string>& profiles,
+                                       int prio) {
     DIR* d;
     char proc_path[PATH_MAX];
     struct dirent* de;
@@ -2502,8 +2527,8 @@ static void set_process_group_and_prio(int pid, SchedPolicy sp, int prio) {
             ALOGW("Unable to raise priority of killing t_pid (%d): errno=%d", t_pid, errno);
         }
 
-        if (set_cpuset_policy(t_pid, sp)) {
-            ALOGW("Failed to set_cpuset_policy on pid(%d) t_pid(%d) to %d", pid, t_pid, (int)sp);
+        if (!SetTaskProfiles(t_pid, profiles, true)) {
+            ALOGW("Failed to set task_profiles on pid(%d) t_pid(%d)", pid, t_pid);
             continue;
         }
     }
@@ -2717,13 +2742,6 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
     maxevents++;
 }
 
-struct kill_info {
-    enum kill_reasons kill_reason;
-    const char *kill_desc;
-    int thrashing;
-    int max_thrashing;
-};
-
 /* Kill one process specified by procp.  Returns the size (in pages) of the process killed */
 static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_info *ki,
                             union meminfo *mi, struct wakeup_info *wi, struct timespec *tm) {
@@ -2790,7 +2808,8 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
         goto out;
     }
 
-    set_process_group_and_prio(pid, SP_FOREGROUND, ANDROID_PRIORITY_HIGHEST);
+    set_process_group_and_prio(pid, {"CPUSET_SP_FOREGROUND", "SCHED_SP_FOREGROUND"},
+                               ANDROID_PRIORITY_HIGHEST);
 
     last_kill_tm = *tm;
 
@@ -2800,7 +2819,6 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
         kill_st.kill_reason = ki->kill_reason;
         kill_st.thrashing = ki->thrashing;
         kill_st.max_thrashing = ki->max_thrashing;
-        killinfo_log(procp, min_oom_score, rss_kb, swap_kb, ki->kill_reason, mi, wi, tm);
         ULMK_LOG(I,"Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
               "kB swap; reason: %s", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb,
               ki->kill_desc);
@@ -2808,10 +2826,10 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
         kill_st.kill_reason = NONE;
         kill_st.thrashing = 0;
         kill_st.max_thrashing = 0;
-        killinfo_log(procp, min_oom_score, rss_kb, swap_kb, NONE, mi, wi, tm);
         ULMK_LOG(I,"Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
               "kb swap", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb);
     }
+    killinfo_log(procp, min_oom_score, rss_kb, swap_kb, ki, mi, wi, tm);
 
     kill_st.uid = static_cast<int32_t>(uid);
     kill_st.taskname = taskname;
@@ -3905,7 +3923,7 @@ static bool init_psi_monitors() {
      * use new kill strategy based on zone watermarks, free swap and thrashing stats
      */
     bool use_new_strategy =
-        property_get_bool("ro.lmk.use_new_strategy", low_ram_device || !use_minfree_levels);
+        GET_LMK_PROPERTY(bool, "use_new_strategy", low_ram_device || !use_minfree_levels);
     if (force_use_old_strategy) {
         use_new_strategy = false;
     }
@@ -4034,7 +4052,7 @@ static void kernel_event_handler(int data __unused, uint32_t events __unused,
 
 static bool init_monitors() {
     /* Try to use psi monitor first if kernel has it */
-    use_psi_monitors = property_get_bool("ro.lmk.use_psi", true) &&
+    use_psi_monitors = GET_LMK_PROPERTY(bool, "use_psi", true) &&
         init_psi_monitors();
     /* Fall back to vmpressure */
     if (!use_psi_monitors &&
@@ -4636,46 +4654,47 @@ static void update_perf_props() {
 static void update_props() {
     /* By default disable low level vmpressure events */
     level_oomadj[VMPRESS_LEVEL_LOW] =
-        property_get_int32("ro.lmk.low", OOM_SCORE_ADJ_MAX + 1);
+        GET_LMK_PROPERTY(int32, "low", OOM_SCORE_ADJ_MAX + 1);
     level_oomadj[VMPRESS_LEVEL_MEDIUM] =
-        property_get_int32("ro.lmk.medium", 800);
+        GET_LMK_PROPERTY(int32, "medium", 800);
     level_oomadj[VMPRESS_LEVEL_CRITICAL] =
-        property_get_int32("ro.lmk.critical", 0);
+        GET_LMK_PROPERTY(int32, "critical", 0);
     /* This will gets updated through perf_get_prop. */
     level_oomadj[VMPRESS_LEVEL_SUPER_CRITICAL] = 606;
-    debug_process_killing = property_get_bool("ro.lmk.debug", false);
+    debug_process_killing = GET_LMK_PROPERTY(bool, "debug", false);
     is_userdebug_or_eng_build = property_get_bool("ro.debuggable", false);
 
     /* By default disable upgrade/downgrade logic */
     enable_pressure_upgrade =
-        property_get_bool("ro.lmk.critical_upgrade", false);
+        GET_LMK_PROPERTY(bool, "critical_upgrade", false);
     upgrade_pressure =
-        (int64_t)property_get_int32("ro.lmk.upgrade_pressure", 100);
+        (int64_t)GET_LMK_PROPERTY(int32, "upgrade_pressure", 100);
     downgrade_pressure =
-        (int64_t)property_get_int32("ro.lmk.downgrade_pressure", 100);
+        (int64_t)GET_LMK_PROPERTY(int32, "downgrade_pressure", 100);
     kill_heaviest_task =
-        property_get_bool("ro.lmk.kill_heaviest_task", false);
+        GET_LMK_PROPERTY(bool, "kill_heaviest_task", false);
     low_ram_device = property_get_bool("ro.config.low_ram", false);
     kill_timeout_ms =
-        (unsigned long)property_get_int32("ro.lmk.kill_timeout_ms", 100);
+        (unsigned long)GET_LMK_PROPERTY(int32, "kill_timeout_ms", 100);
     use_minfree_levels =
-        property_get_bool("ro.lmk.use_minfree_levels", false);
+        GET_LMK_PROPERTY(bool, "use_minfree_levels", false);
     per_app_memcg =
         property_get_bool("ro.config.per_app_memcg", low_ram_device);
-    swap_free_low_percentage = clamp(0, 100, property_get_int32("ro.lmk.swap_free_low_percentage",
+    swap_free_low_percentage = clamp(0, 100, GET_LMK_PROPERTY(int32, "swap_free_low_percentage",
         DEF_LOW_SWAP));
-    psi_partial_stall_ms = property_get_int32("ro.lmk.psi_partial_stall_ms",
+    psi_partial_stall_ms = GET_LMK_PROPERTY(int32, "psi_partial_stall_ms",
         low_ram_device ? DEF_PARTIAL_STALL_LOWRAM : DEF_PARTIAL_STALL);
-    psi_complete_stall_ms = property_get_int32("ro.lmk.psi_complete_stall_ms",
+    psi_complete_stall_ms = GET_LMK_PROPERTY(int32, "psi_complete_stall_ms",
         DEF_COMPLETE_STALL);
-    thrashing_limit_pct = max(0, property_get_int32("ro.lmk.thrashing_limit",
+    thrashing_limit_pct = max(0, GET_LMK_PROPERTY(int32, "thrashing_limit",
         low_ram_device ? DEF_THRASHING_LOWRAM : DEF_THRASHING));
-    thrashing_limit_decay_pct = clamp(0, 100, property_get_int32("ro.lmk.thrashing_limit_decay",
+    thrashing_limit_decay_pct = clamp(0, 100, GET_LMK_PROPERTY(int32, "thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
-    thrashing_critical_pct = max(0, property_get_int32("ro.lmk.thrashing_limit_critical",
+    thrashing_critical_pct = max(0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical",
         thrashing_limit_pct * 2));
-    swap_util_max = clamp(0, 100, property_get_int32("ro.lmk.swap_util_max", 100));
-    filecache_min_kb = property_get_int64("ro.lmk.filecache_min_kb", 0);
+
+    swap_util_max = clamp(0, 100, GET_LMK_PROPERTY(int32, "swap_util_max", 100));
+    filecache_min_kb = GET_LMK_PROPERTY(int64, "filecache_min_kb", 0);
 
     // Update Perf Properties
     update_perf_props();
@@ -4683,7 +4702,7 @@ static void update_props() {
 
 int main(int argc, char **argv) {
     if ((argc > 1) && argv[1] && !strcmp(argv[1], "--reinit")) {
-        if (property_set(LMKD_REINIT_PROP, "0")) {
+        if (property_set(LMKD_REINIT_PROP, "")) {
             ALOGE("Failed to reset " LMKD_REINIT_PROP " property");
         }
         return issue_reinit();
