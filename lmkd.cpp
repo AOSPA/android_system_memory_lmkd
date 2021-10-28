@@ -3112,7 +3112,6 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     static int64_t init_pgscan_direct;
     static int64_t init_direct_throttle;
     static int64_t init_pgskip[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1];
-    static int64_t swap_low_threshold;
     static bool killing;
     static int thrashing_limit = thrashing_limit_pct;
     static struct wakeup_info wi;
@@ -3140,6 +3139,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     int min_score_adj = 0;
     bool in_compaction = false;
     int swap_util = 0;
+    int64_t swap_low_threshold;
     long since_thrashing_reset_ms;
     int64_t workingset_refault_file;
     int64_t pgskip_deltas[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1] = {0};
@@ -3226,10 +3226,10 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
 
     /* Check free swap levels */
     if (swap_free_low_percentage) {
-        if (!swap_low_threshold) {
-            swap_low_threshold = mi.field.total_swap * swap_free_low_percentage / 100;
-        }
+        swap_low_threshold = mi.field.total_swap * swap_free_low_percentage / 100;
         swap_is_low = mi.field.free_swap < swap_low_threshold;
+    } else {
+        swap_low_threshold = 0;
     }
 
     if (vs.field.compact_stall > init_compact_stall) {
