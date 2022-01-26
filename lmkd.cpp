@@ -105,6 +105,7 @@ static inline void trace_kill_end() {}
 
 #define PERCEPTIBLE_APP_ADJ 200
 #define VISIBLE_APP_ADJ 100
+#define PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ 50
 
 /* Android Logger event logtags (see event.logtags) */
 #define KILLINFO_LOG_TAG 10195355
@@ -3138,7 +3139,6 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     static int64_t init_pgscan_direct;
     static int64_t init_direct_throttle;
     static int64_t init_pgskip[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1];
-    static int64_t swap_low_threshold;
     static bool killing;
     static int thrashing_limit = thrashing_limit_pct;
     static struct wakeup_info wi;
@@ -3166,6 +3166,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     int min_score_adj = 0;
     bool in_compaction = false;
     int swap_util = 0;
+    int64_t swap_low_threshold;
     long since_thrashing_reset_ms;
     int64_t workingset_refault_file;
     int64_t pgskip_deltas[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1] = {0};
@@ -3252,10 +3253,10 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
 
     /* Check free swap levels */
     if (swap_free_low_percentage) {
-        if (!swap_low_threshold) {
-            swap_low_threshold = mi.field.total_swap * swap_free_low_percentage / 100;
-        }
+        swap_low_threshold = mi.field.total_swap * swap_free_low_percentage / 100;
         swap_is_low = mi.field.free_swap < swap_low_threshold;
+    } else {
+        swap_low_threshold = 0;
     }
 
     if (vs.field.compact_stall > init_compact_stall) {
@@ -3368,13 +3369,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
          */
         kill_reason = PRESSURE_AFTER_KILL;
         strlcpy(kill_desc, "min watermark is breached even after kill", sizeof(kill_desc));
+        min_score_adj = PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ;
         if (wmark > WMARK_MIN) {
             min_score_adj = VISIBLE_APP_ADJ;
         }
     } else if (reclaim == DIRECT_RECLAIM_THROTTLE) {
         kill_reason = DIRECT_RECL_AND_THROT;
         strlcpy(kill_desc, "system processes are being throttled", sizeof(kill_desc));
-    } else if (level >= VMPRESS_LEVEL_CRITICAL && wmark <= WMARK_HIGH) {
+    } else if (level == VMPRESS_LEVEL_CRITICAL && wmark <= WMARK_HIGH) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
          * Critical level is triggered when PSI complete stall (all tasks are blocked because
@@ -3382,6 +3384,22 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
          */
         kill_reason = CRITICAL_KILL;
         strlcpy(kill_desc, "critical pressure and device is low on memory", sizeof(kill_desc));
+        min_score_adj = PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ;
+    } else if (level == VMPRESS_LEVEL_SUPER_CRITICAL && wmark <= WMARK_HIGH) {
+        /*
+         * Device is too busy reclaiming memory which might lead to ANR.
+         * Critical level is triggered when PSI complete stall (all tasks are blocked because
+         * of the memory congestion) breaches the configured threshold.
+         */
+        /*
+         * The preexisting NOT_RESPONDING event was only allowed 1 kill per psi window. Instead
+         * allow very agressive killing of all apps without considering thrashing, under the
+         * assumption that this event will not be triggered unless file cache is very small.
+         * Intended to kill memory stress tests which allocate memory with the intention of
+         * reaching OOM.
+         */
+        kill_reason = NOT_RESPONDING;
+        strncpy(kill_desc, "device is not responding", sizeof(kill_desc));
     } else if (swap_is_low && thrashing > thrashing_limit_pct) {
         /* Page cache is thrashing while swap is low */
         kill_reason = LOW_SWAP_AND_THRASHING;
@@ -3419,9 +3437,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and thrashing (%"
             PRId64 "%%)", wmark < WMARK_LOW ? "min" : "low", thrashing);
         cut_thrashing_limit = true;
-        if (thrashing < thrashing_critical_pct) {
-            min_score_adj = VISIBLE_APP_ADJ;
-        }
+        min_score_adj = VISIBLE_APP_ADJ;
+
         check_filecache = true;
     } else if (reclaim == DIRECT_RECLAIM && thrashing > thrashing_limit) {
         /* Page cache is thrashing while in direct reclaim (mostly happens on lowram devices) */
@@ -3430,9 +3447,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             PRId64 "%%)", thrashing);
         cut_thrashing_limit = true;
         /* Do not kill perceptible apps unless thrashing at critical levels */
-        if (thrashing < thrashing_critical_pct) {
-            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
-        }
+        min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+
         check_filecache = true;
     } else if (check_filecache) {
         int64_t file_lru_kb = (vs.field.nr_inactive_file + vs.field.nr_active_file) * page_k;
@@ -4267,7 +4283,8 @@ static void call_handler(struct event_handler_info* handler_info,
         break;
     case POLLING_CRIT_UPGRADE:
         poll_params->poll_start_tm = curr_tm;
-        poll_params->poll_handler = &vmpressure_hinfo[VMPRESS_LEVEL_CRITICAL];
+        if ((enum vmpressure_level)handler_info->data <= VMPRESS_LEVEL_CRITICAL)
+            poll_params->poll_handler = &vmpressure_hinfo[VMPRESS_LEVEL_CRITICAL];
         break;
     }
 }
