@@ -4685,7 +4685,8 @@ static int init(void) {
     maxevents++;
 
     has_inkernel_module = !access(INKERNEL_MINFREE_PATH, W_OK);
-    use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
+    use_inkernel_interface = has_inkernel_module &&
+        (property_get_bool("ro.vendor.lmk.force_inkernel_lmk", false) || !enable_userspace_lmk);
 
     if (use_inkernel_interface) {
         ALOGI("Using in-kernel low memory killer interface");
