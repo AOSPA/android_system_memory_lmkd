@@ -4888,9 +4888,10 @@ int main(int argc, char **argv) {
                 reaper.thread_cnt());
         }
 
-        if (!watchdog.init()) {
+/*        if (!watchdog.init()) {
             ALOGE("Failed to initialize the watchdog");
         }
+*/
 
         mainloop();
     }
