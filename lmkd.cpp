@@ -4890,7 +4890,8 @@ int main(int argc, char **argv) {
 
 /*        if (!watchdog.init()) {
             ALOGE("Failed to initialize the watchdog");
-        }*/
+        }
+*/
 
         mainloop();
     }
