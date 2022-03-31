@@ -180,6 +180,8 @@
 
 #define NATIVE_PID_FD (-128)
 
+#define ENABLE_TRACING
+
 /* default to old in-kernel interface if no memory pressure events */
 static bool use_inkernel_interface = true;
 static bool has_inkernel_module;
@@ -2235,6 +2237,7 @@ static int parse_one_zone_watermark(char *buf, struct watermark_info *w)
     return ret;
 }
 
+#ifdef ENABLE_TRACING
 static void trace_log(const char *fmt, ...)
 {
     char buf[PAGE_SIZE];
@@ -2273,6 +2276,9 @@ static void trace_log(const char *fmt, ...)
     ALOG##X(fmt);              \
     trace_log(fmt);            \
 })
+#else
+#define ULMK_LOG(X, fmt...) ALOG##X(fmt)
+#endif
 
 static int file_cache_to_adj(enum vmpressure_level __unused lvl, int nr_free,
 int nr_file)
