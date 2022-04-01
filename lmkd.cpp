@@ -4484,6 +4484,7 @@ static void call_handler(struct event_handler_info* handler_info,
             poll_params->poll_handler = &vmpressure_hinfo[VMPRESS_LEVEL_CRITICAL];
         break;
     }
+    watchdog.stop();
 }
 
 static bool have_psi_events(struct epoll_event *evt, int nevents)
@@ -4538,7 +4539,6 @@ static void check_cont_lmkd_events(int lvl)
     } else {
         count_upgraded_event = 0;
     }
-    watchdog.stop();
 }
 
 static void mainloop(void) {
