@@ -38,6 +38,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <shared_mutex>
 
 #include <cutils/properties.h>
@@ -112,7 +114,6 @@ static inline void trace_kill_end() {}
 #define INKERNEL_MINFREE_PATH "/sys/module/lowmemorykiller/parameters/minfree"
 #define INKERNEL_ADJ_PATH "/sys/module/lowmemorykiller/parameters/adj"
 
-#define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
 #define EIGHT_MEGA (1 << 23)
 
 #define TARGET_UPDATE_MIN_INTERVAL_MS 1000
@@ -150,9 +151,6 @@ static inline void trace_kill_end() {}
 #define PSI_POLL_PERIOD_LONG_MS 100
 /* PSI complete stall for super critical events */
 #define PSI_SCRIT_COMPLETE_STALL_MS (75)
-
-#define min(a, b) (((a) < (b)) ? (a) : (b))
-#define max(a, b) (((a) > (b)) ? (a) : (b))
 
 #define FAIL_REPORT_RLIMIT_MS 1000
 
@@ -248,6 +246,7 @@ static int thrashing_limit_decay_pct;
 static int thrashing_critical_pct;
 static int swap_util_max;
 static int64_t filecache_min_kb;
+static int64_t stall_limit_critical;
 static bool use_psi_monitors = false;
 static bool enable_preferred_apps =  false;
 static bool last_event_upgraded = false;
@@ -330,8 +329,8 @@ static int maxevents;
 #define OOM_SCORE_ADJ_MIN       (-1000)
 #define OOM_SCORE_ADJ_MAX       1000
 
-static int lowmem_adj[MAX_TARGETS];
-static int lowmem_minfree[MAX_TARGETS];
+static std::array<int, MAX_TARGETS> lowmem_adj;
+static std::array<int, MAX_TARGETS> lowmem_minfree;
 static int lowmem_targets_size;
 
 /* Fields to parse in /proc/zoneinfo */
@@ -657,7 +656,7 @@ static bool init_monitors();
 static void destroy_monitors();
 
 static int clamp(int low, int high, int value) {
-    return max(min(value, high), low);
+    return std::max(std::min(value, high), low);
 }
 
 static bool parse_int64(const char* str, int64_t* ret) {
@@ -938,7 +937,7 @@ static void poll_kernel(int poll_fd) {
 
     while (1) {
         char rd_buf[256];
-        int bytes_read = TEMP_FAILURE_RETRY(pread(poll_fd, (void*)rd_buf, sizeof(rd_buf), 0));
+        int bytes_read = TEMP_FAILURE_RETRY(pread(poll_fd, (void*)rd_buf, sizeof(rd_buf) - 1, 0));
         if (bytes_read <= 0) break;
         rd_buf[bytes_read] = '\0';
 
@@ -1562,8 +1561,9 @@ static void cmd_target(int ntargets, LMKD_CTRL_PACKET packet) {
     static struct timespec last_req_tm;
     struct timespec curr_tm;
 
-    if (ntargets < 1 || ntargets > (int)ARRAY_SIZE(lowmem_adj))
+    if (ntargets < 1 || ntargets > (int)lowmem_adj.size()) {
         return;
+    }
 
     /*
      * Ratelimit minfree updates to once per TARGET_UPDATE_MIN_INTERVAL_MS
@@ -1655,8 +1655,9 @@ static void ctrl_command_handler(int dsock_idx) {
     switch(cmd) {
     case LMK_TARGET:
         targets = nargs / 2;
-        if (nargs & 0x1 || targets > (int)ARRAY_SIZE(lowmem_adj))
+        if (nargs & 0x1 || targets > (int)lowmem_adj.size()) {
             goto wronglen;
+        }
         cmd_target(targets, packet);
         break;
     case LMK_PROCPRIO:
@@ -2108,6 +2109,53 @@ static int vmstat_parse(union vmstat *vs) {
     return 0;
 }
 
+static int psi_parse(struct reread_data *file_data, struct psi_stats stats[], bool full) {
+    char *buf;
+    char *save_ptr;
+    char *line;
+
+    if ((buf = reread_file(file_data)) == NULL) {
+        return -1;
+    }
+
+    line = strtok_r(buf, "\n", &save_ptr);
+    if (parse_psi_line(line, PSI_SOME, stats)) {
+        return -1;
+    }
+    if (full) {
+        line = strtok_r(NULL, "\n", &save_ptr);
+        if (parse_psi_line(line, PSI_FULL, stats)) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int psi_parse_mem(struct psi_data *psi_data) {
+    static struct reread_data file_data = {
+        .filename = PSI_PATH_MEMORY,
+        .fd = -1,
+    };
+    return psi_parse(&file_data, psi_data->mem_stats, true);
+}
+
+static int psi_parse_io(struct psi_data *psi_data) {
+    static struct reread_data file_data = {
+        .filename = PSI_PATH_IO,
+        .fd = -1,
+    };
+    return psi_parse(&file_data, psi_data->io_stats, true);
+}
+
+static int psi_parse_cpu(struct psi_data *psi_data) {
+    static struct reread_data file_data = {
+        .filename = PSI_PATH_CPU,
+        .fd = -1,
+    };
+    return psi_parse(&file_data, psi_data->cpu_stats, false);
+}
+
 enum wakeup_reason {
     Event,
     Polling
@@ -2152,18 +2200,19 @@ struct kill_info {
 
 static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
                          int swap_kb, struct kill_info *ki, union meminfo *mi,
-                         struct wakeup_info *wi, struct timespec *tm) {
+                         struct wakeup_info *wi, struct timespec *tm, struct psi_data *pd) {
     /* log process information */
     android_log_write_int32(ctx, procp->pid);
     android_log_write_int32(ctx, procp->uid);
     android_log_write_int32(ctx, procp->oomadj);
     android_log_write_int32(ctx, min_oom_score);
-    android_log_write_int32(ctx, (int32_t)min(rss_kb, INT32_MAX));
+    android_log_write_int32(ctx, std::min(rss_kb, (int)INT32_MAX));
     android_log_write_int32(ctx, ki ? ki->kill_reason : NONE);
 
     /* log meminfo fields */
     for (int field_idx = 0; field_idx < MI_FIELD_COUNT; field_idx++) {
-        android_log_write_int32(ctx, mi ? (int32_t)min(mi->arr[field_idx] * page_k, INT32_MAX): 0);
+        android_log_write_int32(ctx,
+                                mi ? std::min(mi->arr[field_idx] * page_k, (int64_t)INT32_MAX) : 0);
     }
 
     /* log lmkd wakeup information */
@@ -2179,7 +2228,7 @@ static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
         android_log_write_int32(ctx, 0);
     }
 
-    android_log_write_int32(ctx, (int32_t)min(swap_kb, INT32_MAX));
+    android_log_write_int32(ctx, std::min(swap_kb, (int)INT32_MAX));
     android_log_write_int32(ctx, mi ? (int32_t)mi->field.total_gpu_kb : 0);
     if (ki) {
         android_log_write_int32(ctx, ki->thrashing);
@@ -2187,6 +2236,18 @@ static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
     } else {
         android_log_write_int32(ctx, 0);
         android_log_write_int32(ctx, 0);
+    }
+
+    if (pd) {
+        android_log_write_float32(ctx, pd->mem_stats[PSI_SOME].avg10);
+        android_log_write_float32(ctx, pd->mem_stats[PSI_FULL].avg10);
+        android_log_write_float32(ctx, pd->io_stats[PSI_SOME].avg10);
+        android_log_write_float32(ctx, pd->io_stats[PSI_FULL].avg10);
+        android_log_write_float32(ctx, pd->cpu_stats[PSI_SOME].avg10);
+    } else {
+        for (int i = 0; i < 5; i++) {
+            android_log_write_float32(ctx, 0);
+        }
     }
 
     android_log_write_list(ctx, LOG_ID_EVENTS);
@@ -2695,7 +2756,7 @@ static void watchdog_callback() {
 
         if (reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
             ALOGW("lmkd watchdog killed process %d, oom_score_adj %d", target.pid, oom_score);
-            killinfo_log(&target, 0, 0, 0, NULL, NULL, NULL, NULL);
+            killinfo_log(&target, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
             break;
         }
         prev_pid = target.pid;
@@ -2817,7 +2878,8 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
 
 /* Kill one process specified by procp.  Returns the size (in pages) of the process killed */
 static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_info *ki,
-                            union meminfo *mi, struct wakeup_info *wi, struct timespec *tm) {
+                            union meminfo *mi, struct wakeup_info *wi, struct timespec *tm,
+                            struct psi_data *pd) {
     int pid = procp->pid;
     int pidfd = procp->pidfd;
     uid_t uid = procp->uid;
@@ -2894,7 +2956,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
         ULMK_LOG(I,"Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
               "kb swap", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb);
     }
-    killinfo_log(procp, min_oom_score, rss_kb, swap_kb, ki, mi, wi, tm);
+    killinfo_log(procp, min_oom_score, rss_kb, swap_kb, ki, mi, wi, tm, pd);
 
     kill_st.uid = static_cast<int32_t>(uid);
     kill_st.taskname = taskname;
@@ -2922,7 +2984,8 @@ out:
  * Returns size of the killed process.
  */
 static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union meminfo *mi,
-                                 struct wakeup_info *wi, struct timespec *tm) {
+                                 struct wakeup_info *wi, struct timespec *tm,
+                                 struct psi_data *pd) {
     int i;
     int killed_size = 0;
     bool lmk_state_change_start = false;
@@ -2946,7 +3009,7 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
             if (!procp)
                 break;
 
-            killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm);
+            killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
             if (killed_size >= 0) {
                 if (!lmk_state_change_start) {
                     lmk_state_change_start = true;
@@ -3216,6 +3279,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
 
     union meminfo mi;
     union vmstat vs;
+    struct psi_data psi_data;
     struct timespec curr_tm;
     int64_t thrashing = 0;
     bool swap_is_low = false;
@@ -3233,6 +3297,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     int64_t swap_low_threshold;
     long since_thrashing_reset_ms;
     int64_t workingset_refault_file;
+    bool critical_stall = false;
     int64_t pgskip_deltas[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1] = {0};
     struct zoneinfo zi;
 
@@ -3421,6 +3486,9 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         last_event_upgraded = true;
     }
 
+    if (!psi_parse_mem(&psi_data)) {
+        critical_stall = psi_data.mem_stats[PSI_FULL].avg10 > (float)stall_limit_critical;
+    }
     /*
      * TODO: move this logic into a separate function
      * Decide if killing a process is necessary and record the reason
@@ -3546,15 +3614,22 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             .thrashing = (int)thrashing,
             .max_thrashing = max_thrashing,
         };
-        int pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm);
+
+        /* Allow killing perceptible apps if the system is stalled */
+        if (critical_stall) {
+            min_score_adj = 0;
+        }
+        psi_parse_io(&psi_data);
+        psi_parse_cpu(&psi_data);
+        int pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
         if (pages_freed > 0) {
             killing = true;
             max_thrashing = 0;
             /* Killed..Just reduce/increase the boost... */
             if (kill_reason == CRITICAL_KILL || kill_reason == DIRECT_RECL_AND_THROT) {
-                wbf_effective =  min(wbf_effective + wbf_step, wmark_boost_factor);
+                wbf_effective =  std::min(wbf_effective + wbf_step, wmark_boost_factor);
             } else {
-                wbf_effective = max(wbf_effective - wbf_step, 1);
+                wbf_effective = std::max(wbf_effective - wbf_step, 1);
             }
             if (cut_thrashing_limit) {
                 /*
@@ -3594,7 +3669,7 @@ no_kill:
         } else if (!poll_params->poll_handler || data >= poll_params->poll_handler->data) {
             poll_params->update = POLLING_START;
             if (!killing) {
-                wbf_effective = max(wbf_effective - wbf_step, 1);
+                wbf_effective = std::max(wbf_effective - wbf_step, 1);
             }
         }
     }
@@ -3887,7 +3962,7 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 do_kill:
     if (low_ram_device && per_app_memcg) {
         /* For Go devices kill only one task */
-        if (find_and_kill_process(level_oomadj[level], NULL, &mi, &wi, &curr_tm) == 0) {
+        if (find_and_kill_process(level_oomadj[level], NULL, &mi, &wi, &curr_tm, NULL) == 0) {
             if (debug_process_killing) {
                 ALOGI("Nothing to kill");
             }
@@ -3918,7 +3993,7 @@ do_kill:
             }
         }
 
-        pages_freed = find_and_kill_process(min_score_adj, NULL, &mi, &wi, &curr_tm);
+        pages_freed = find_and_kill_process(min_score_adj, NULL, &mi, &wi, &curr_tm, NULL);
 
         if (pages_freed == 0) {
             /* Rate limit kill reports when nothing was reclaimed */
@@ -4828,15 +4903,16 @@ static void update_props() {
         low_ram_device ? DEF_PARTIAL_STALL_LOWRAM : DEF_PARTIAL_STALL);
     psi_complete_stall_ms = GET_LMK_PROPERTY(int32, "psi_complete_stall_ms",
         DEF_COMPLETE_STALL);
-    thrashing_limit_pct = max(0, GET_LMK_PROPERTY(int32, "thrashing_limit",
-        low_ram_device ? DEF_THRASHING_LOWRAM : DEF_THRASHING));
+    thrashing_limit_pct =
+            std::max(0, GET_LMK_PROPERTY(int32, "thrashing_limit",
+                                         low_ram_device ? DEF_THRASHING_LOWRAM : DEF_THRASHING));
     thrashing_limit_decay_pct = clamp(0, 100, GET_LMK_PROPERTY(int32, "thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
-    thrashing_critical_pct = max(0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical",
-        thrashing_limit_pct * 2));
-
+    thrashing_critical_pct = std::max(
+            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", thrashing_limit_pct * 2));
     swap_util_max = clamp(0, 100, GET_LMK_PROPERTY(int32, "swap_util_max", 100));
     filecache_min_kb = GET_LMK_PROPERTY(int64, "filecache_min_kb", 0);
+    stall_limit_critical = GET_LMK_PROPERTY(int64, "stall_limit_critical", 100);
 
     reaper.enable_debug(debug_process_killing);
 
