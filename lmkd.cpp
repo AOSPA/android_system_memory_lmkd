@@ -4640,7 +4640,8 @@ static void call_handler(struct event_handler_info* handler_info,
         resume_polling(poll_params, curr_tm);
         break;
     case POLLING_DO_NOT_CHANGE:
-        if (get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > psi_window_size_ms) {
+        if (poll_params->poll_handler &&
+            get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > psi_window_size_ms) {
             /* Polled for the duration of PSI window, time to stop */
             poll_params->poll_handler = NULL;
             poll_params->paused_handler = NULL;
