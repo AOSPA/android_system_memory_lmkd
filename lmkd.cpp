@@ -252,6 +252,7 @@ static int count_upgraded_event;
 static long pa_update_timeout_ms = 60000; /* 1 min */
 static int kpoll_fd;
 static int psi_cont_event_thresh = PSI_CONT_EVENT_THRESH;
+static bool use_perf_api_for_pref_apps;
 /* PSI window related variables */
 static int psi_window_size_ms = PSI_WINDOW_SIZE_MS;
 static int psi_poll_period_scrit_ms = PSI_POLL_PERIOD_SHORT_MS;
@@ -606,9 +607,11 @@ typedef struct {
 
 #define PREFERRED_OUT_LENGTH 12288
 #define PAPP_OPCODE 10
+#define PAPP_PERF_TRIGGER 0x00001607
 
 char *preferred_apps;
 void (*perf_ux_engine_trigger)(int, char *) = NULL;
+const char * (*perf_sync_request)(int) = NULL;
 
 #define PIDHASH_SZ 1024
 static struct proc *pidhash[PIDHASH_SZ];
@@ -3320,7 +3323,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (level == VMPRESS_LEVEL_MEDIUM) {
         if (enable_preferred_apps &&
                 (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
-            perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+            if (!use_perf_api_for_pref_apps) {
+                if (perf_ux_engine_trigger) {
+                    perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                }
+            } else {
+                if (perf_sync_request) {
+                    strlcpy(preferred_apps, perf_sync_request(PAPP_PERF_TRIGGER), PREFERRED_OUT_LENGTH * sizeof(char));
+                }
+            }
             last_pa_update_tm = curr_tm;
         }
     }
@@ -3414,7 +3425,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     } else if (workingset_refault_file == prev_workingset_refault) {
         if (enable_preferred_apps &&
                   (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
-              perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+              if (!use_perf_api_for_pref_apps) {
+                  if (perf_ux_engine_trigger) {
+                      perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                  }
+              } else {
+                  if (perf_sync_request) {
+                      strlcpy(preferred_apps, perf_sync_request(PAPP_PERF_TRIGGER), PREFERRED_OUT_LENGTH * sizeof(char));
+                  }
+              }
               last_pa_update_tm = curr_tm;
         }
 
@@ -3921,7 +3940,15 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
         record_low_pressure_levels(&mi);
         if (enable_preferred_apps) {
             if (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms) {
-                perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                if (!use_perf_api_for_pref_apps) {
+                    if (perf_ux_engine_trigger) {
+                        perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                    }
+                } else {
+                    if (perf_sync_request) {
+                        strlcpy(preferred_apps, perf_sync_request(PAPP_PERF_TRIGGER), PREFERRED_OUT_LENGTH * sizeof(char));
+                    }
+                }
                 last_pa_update_tm = curr_tm;
             }
         }
@@ -4762,23 +4789,33 @@ int issue_reinit() {
 
 static void init_PreferredApps() {
     void *handle = NULL;
-    handle = dlopen(IOPD_LIB, RTLD_NOW);
-    if (handle != NULL) {
-        perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle, "perf_ux_engine_trigger");
+    if (!use_perf_api_for_pref_apps) {
+        handle = dlopen(IOPD_LIB, RTLD_NOW);
+        if (handle != NULL) {
+            perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle, "perf_ux_engine_trigger");
+        }
+    } else {
+        handle = dlopen(PERFD_LIB, RTLD_NOW);
+        if (handle != NULL) {
+            perf_sync_request = (const char* (*)(int))dlsym(handle, "perf_sync_request");
+        }
+    }
 
-        if (!perf_ux_engine_trigger) {
-            ALOGE("Couldn't obtain perf_ux_engine_trigger");
+    if (perf_ux_engine_trigger || perf_sync_request) {
+        // Initialize preferred_apps
+        preferred_apps = (char *) malloc ( PREFERRED_OUT_LENGTH * sizeof(char));
+        if (preferred_apps == NULL) {
             enable_preferred_apps = false;
         } else {
-            // Initialize preferred_apps
-            preferred_apps = (char *) malloc ( PREFERRED_OUT_LENGTH * sizeof(char));
-            if (preferred_apps == NULL) {
-                enable_preferred_apps = false;
-            } else {
-                memset(preferred_apps, 0, PREFERRED_OUT_LENGTH);
-                preferred_apps[0] = '\0';
-            }
+            memset(preferred_apps, 0, PREFERRED_OUT_LENGTH);
+            preferred_apps[0] = '\0';
         }
+    } else {
+        ALOGE("Couldn't obtain API to obtain Preferred Apps");
+        enable_preferred_apps = false;
+    }
+    if (handle != NULL) {
+        dlclose(handle);
     }
 }
 
@@ -4901,6 +4938,8 @@ static void update_perf_props() {
         enable_watermark_check = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
         strlcpy(property, perf_get_prop("ro.lmk.enable_preferred_apps", "false").value, PROPERTY_VALUE_MAX);
         enable_preferred_apps = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
+        strlcpy(property, perf_get_prop("ro.vendor.use_perf_hal_for_preferredapps", "false").value, PROPERTY_VALUE_MAX);
+        use_perf_api_for_pref_apps = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
         snprintf(default_value, PROPERTY_VALUE_MAX, "%d", wmark_boost_factor);
         strlcpy(property,
             perf_get_prop("ro.lmk.nstrat_wmark_boost_factor", default_value).value,
