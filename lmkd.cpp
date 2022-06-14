@@ -46,6 +46,7 @@
 #include <cutils/sockets.h>
 #include <liblmkd_utils.h>
 #include <lmkd.h>
+#include <lmkd_hooks.h>
 #include <log/log.h>
 #include <log/log_event_list.h>
 #include <log/log_time.h>
@@ -649,7 +650,7 @@ static long page_k = PAGE_SIZE / 1024;
 static void init_PreferredApps();
 static void update_perf_props();
 
-static void update_props();
+static bool update_props();
 static bool init_monitors();
 static void destroy_monitors();
 
@@ -1697,14 +1698,19 @@ static void ctrl_command_handler(int dsock_idx) {
     case LMK_UPDATE_PROPS:
         if (nargs != 0)
             goto wronglen;
-        update_props();
-        if (!use_inkernel_interface) {
-            /* Reinitialize monitors to apply new settings */
-            destroy_monitors();
-            result = init_monitors() ? 0 : -1;
-        } else {
-            result = 0;
+        result = -1;
+        if (update_props()) {
+            if (!use_inkernel_interface) {
+                /* Reinitialize monitors to apply new settings */
+                destroy_monitors();
+                if (init_monitors()) {
+                    result = 0;
+                }
+            } else {
+                result = 0;
+            }
         }
+
         len = lmkd_pack_set_update_props_repl(packet, result);
         if (ctrl_data_write(dsock_idx, (char *)packet, len) != len) {
             ALOGE("Failed to report operation results");
@@ -2924,6 +2930,17 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
 
     snprintf(desc, sizeof(desc), "lmk,%d,%d,%d,%d,%d", pid, ki ? (int)ki->kill_reason : -1,
              procp->oomadj, min_oom_score, ki ? ki->max_thrashing : -1);
+
+    result = lmkd_free_memory_before_kill_hook(procp, rss_kb / page_k, min_oom_score,
+                                               ki ? (int)ki->kill_reason : -1);
+    if (result > 0) {
+      /*
+       * Memory was freed elsewhere; no need to kill. Note: intentionally do not
+       * pid_remove(pid) since it was not killed.
+       */
+      ALOGI("Skipping kill; %ld kB freed elsewhere.", result * page_k);
+      return result;
+    }
 
     trace_kill_start(pid, desc);
 
@@ -4184,7 +4201,7 @@ static bool init_mp_common(enum vmpressure_level level) {
         goto err_open_mpfd;
     }
 
-    evctlfd = open(GetCgroupAttributePath("CgroupEventControl").c_str(), O_WRONLY | O_CLOEXEC);
+    evctlfd = open(GetCgroupAttributePath("MemCgroupEventControl").c_str(), O_WRONLY | O_CLOEXEC);
     if (evctlfd < 0) {
         ALOGI("No kernel memory cgroup event control (errno=%d)", errno);
         goto err_open_evctlfd;
@@ -4477,6 +4494,11 @@ static int init(void) {
     }
     ALOGI("Process polling is %s", pidfd_supported ? "supported" : "not supported" );
 
+    if (!lmkd_init_hook()) {
+        ALOGE("Failed to initialize LMKD hooks.");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -4521,7 +4543,8 @@ static void call_handler(struct event_handler_info* handler_info,
         resume_polling(poll_params, curr_tm);
         break;
     case POLLING_DO_NOT_CHANGE:
-        if (get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > psi_window_size_ms) {
+        if (poll_params->poll_handler &&
+            get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > psi_window_size_ms) {
             /* Polled for the duration of PSI window, time to stop */
             poll_params->poll_handler = NULL;
             poll_params->paused_handler = NULL;
@@ -4919,7 +4942,7 @@ static void update_perf_props() {
     }
 }
 
-static void update_props() {
+static bool update_props() {
     /* By default disable low level vmpressure events */
     level_oomadj[VMPRESS_LEVEL_LOW] =
         GET_LMK_PROPERTY(int32, "low", OOM_SCORE_ADJ_MAX + 1);
@@ -4969,6 +4992,13 @@ static void update_props() {
 
     // Update Perf Properties
     update_perf_props();
+    /* Call the update props hook */
+    if (!lmkd_update_props_hook()) {
+        ALOGE("Failed to update LMKD hook props.");
+        return false;
+    }
+
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -4979,7 +5009,10 @@ int main(int argc, char **argv) {
         return issue_reinit();
     }
 
-    update_props();
+    if (!update_props()) {
+        ALOGE("Failed to initialize props, exiting.");
+        return -1;
+    }
 
     ctx = create_android_logger(KILLINFO_LOG_TAG);
 
