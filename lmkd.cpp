@@ -650,6 +650,10 @@ static long page_k = PAGE_SIZE / 1024;
 
 static void init_PreferredApps();
 static void update_perf_props();
+static void create_handle_for_perf_iop();
+static void close_handle_for_perf_iop();
+static void * handle_iopd = NULL;
+static void * handle_perfd = NULL;
 
 static bool update_props();
 static bool init_monitors();
@@ -3346,7 +3350,11 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
                 }
             } else {
                 if (perf_sync_request) {
-                    strlcpy(preferred_apps, perf_sync_request(PAPP_PERF_TRIGGER), PREFERRED_OUT_LENGTH * sizeof(char));
+                    const char * tmp = perf_sync_request(PAPP_PERF_TRIGGER);
+                    if (tmp != NULL) {
+                        strlcpy(preferred_apps, tmp, strlen(tmp));
+                        free((void *)tmp);
+                    }
                 }
             }
             last_pa_update_tm = curr_tm;
@@ -3448,7 +3456,11 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
                   }
               } else {
                   if (perf_sync_request) {
-                      strlcpy(preferred_apps, perf_sync_request(PAPP_PERF_TRIGGER), PREFERRED_OUT_LENGTH * sizeof(char));
+                      const char * tmp = perf_sync_request(PAPP_PERF_TRIGGER);
+                      if (tmp != NULL) {
+                          strlcpy(preferred_apps, tmp, strlen(tmp));
+                          free((void *)tmp);
+                      }
                   }
               }
               last_pa_update_tm = curr_tm;
@@ -3963,7 +3975,11 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
                     }
                 } else {
                     if (perf_sync_request) {
-                        strlcpy(preferred_apps, perf_sync_request(PAPP_PERF_TRIGGER), PREFERRED_OUT_LENGTH * sizeof(char));
+                        const char * tmp = perf_sync_request(PAPP_PERF_TRIGGER);
+                        if (tmp != NULL) {
+                            strlcpy(preferred_apps, tmp, strlen(tmp));
+                            free((void *)tmp);
+                        }
                     }
                 }
                 last_pa_update_tm = curr_tm;
@@ -4811,17 +4827,29 @@ int issue_reinit() {
     return res == UPDATE_PROPS_SUCCESS ? 0 : -1;
 }
 
+static void create_handle_for_perf_iop() {
+    handle_perfd = dlopen(PERFD_LIB, RTLD_NOW);
+    handle_iopd = dlopen(IOPD_LIB, RTLD_NOW);
+}
+
+static void close_handle_for_perf_iop() {
+    if (handle_perfd != NULL) {
+        dlclose(handle_perfd);
+    }
+    if (handle_iopd != NULL) {
+        dlclose(handle_iopd);
+    }
+}
+
 static void init_PreferredApps() {
     void *handle = NULL;
     if (!use_perf_api_for_pref_apps) {
-        handle = dlopen(IOPD_LIB, RTLD_NOW);
-        if (handle != NULL) {
-            perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle, "perf_ux_engine_trigger");
+        if (handle_iopd != NULL) {
+            perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle_iopd, "perf_ux_engine_trigger");
         }
     } else {
-        handle = dlopen(PERFD_LIB, RTLD_NOW);
-        if (handle != NULL) {
-            perf_sync_request = (const char* (*)(int))dlsym(handle, "perf_sync_request");
+        if (handle_perfd != NULL) {
+            perf_sync_request = (const char* (*)(int))dlsym(handle_perfd, "perf_sync_request");
         }
     }
 
@@ -4838,9 +4866,6 @@ static void init_PreferredApps() {
         ALOGE("Couldn't obtain API to obtain Preferred Apps");
         enable_preferred_apps = false;
     }
-    if (handle != NULL) {
-        dlclose(handle);
-    }
 }
 
 static void update_perf_props() {
@@ -4852,10 +4877,9 @@ static void update_perf_props() {
 
     /* Loading the vendor library at runtime to access property value */
     PropVal (*perf_get_prop)(const char *, const char *) = NULL;
-    void *handle = NULL;
-    handle = dlopen(PERFD_LIB, RTLD_NOW);
-    if (handle != NULL) {
-        perf_get_prop = (PropVal (*)(const char *, const char *))dlsym(handle, "perf_get_prop");
+    create_handle_for_perf_iop();
+    if (handle_perfd != NULL) {
+        perf_get_prop = (PropVal (*)(const char *, const char *))dlsym(handle_perfd, "perf_get_prop");
     }
 
     if (!perf_get_prop) {
@@ -5096,7 +5120,7 @@ int main(int argc, char **argv) {
     }
 
     android_log_destroy(&ctx);
-
+    close_handle_for_perf_iop();
     ALOGI("exiting");
     return 0;
 }
