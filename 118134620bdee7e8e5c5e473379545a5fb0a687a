@@ -1,0 +1,21 @@
+{
+  "comments": [
+    {
+      "unresolved": false,
+      "key": {
+        "uuid": "ce840b4c_0ed3d995",
+        "filename": "/PATCHSET_LEVEL",
+        "patchSetId": 1
+      },
+      "lineNbr": 0,
+      "author": {
+        "id": 1000062
+      },
+      "writtenOn": "2022-07-17T04:59:13Z",
+      "side": 1,
+      "message": "This potentially conflicts with earlier changes that I\u0027ve made locally to PA. Will manually test and merge later.",
+      "revId": "118134620bdee7e8e5c5e473379545a5fb0a687a",
+      "serverId": "3162e3d8-d894-470e-abd9-724f7b0effad"
+    }
+  ]
+}
