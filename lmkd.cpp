@@ -3052,9 +3052,11 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     struct zone_watermarks *watermarks = &zmi->watermarks;
     int64_t nr_free_pages = zmi->nr_free_pages - zmi->cma_free;
     int64_t nr_cached_pages = 0;
+    int64_t file_cache;
 
     if (should_consider_cache_free(events, level)) {
-        nr_cached_pages = (int64_t)(cache_percent * mi->field.cached);
+        file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem;
+        nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
     if (nr_free_pages + nr_cached_pages < watermarks->min_wmark) {
         return WMARK_MIN;
