@@ -384,6 +384,7 @@ struct zoneinfo_zone {
     union zoneinfo_zone_fields fields;
     int64_t protection[MAX_NR_ZONES];
     int64_t max_protection;
+    char name[LINE_MAX];
 };
 
 /* zoneinfo per-node fields */
@@ -1881,7 +1882,7 @@ static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone) {
     return false;
 }
 
-static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
+static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node, char *name) {
     int fields_to_match = ZI_NODE_FIELD_COUNT;
 
     for (char *line = strtok_r(NULL, "\n", buf); line;
@@ -1891,7 +1892,19 @@ static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
         char *save_ptr;
         int64_t val;
         int field_idx;
+        char zone_name[LINE_MAX + 1];
         enum field_match_result match_res;
+
+        /*
+         * Empty zones would not have per-zone stats, so we might come across a
+         * new zone next. Update zone_name and continue parsing.
+         */
+        if (sscanf(line, "Node %d, zone %" STRINGIFY(LINE_MAX) "s", &node->id, zone_name) == 2) {
+            ALOGE("%s per-node stats not found in zone %s; moving to next zone", __func__, name);
+
+            /* update zone name to be used in struct zoneinfo_zone.name */
+            strlcpy(name, zone_name, LINE_MAX);
+        }
 
         cp = strtok_r(line, " ", &save_ptr);
         if (!cp) {
@@ -1956,7 +1969,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 node = &zi->nodes[node_idx];
                 node->id = node_id;
                 zone_idx = 0;
-                if (!zoneinfo_parse_node(&save_ptr, node)) {
+                if (!zoneinfo_parse_node(&save_ptr, node, zone_name)) {
                     ALOGE("%s parse error", file_data.filename);
                     return -1;
                 }
@@ -1968,6 +1981,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 ALOGE("%s parse error", file_data.filename);
                 return -1;
             }
+            strlcpy(node->zones[zone_idx].name, zone_name, LINE_MAX);
         }
     }
     if (!node) {
@@ -3206,8 +3220,25 @@ static void log_zone_watermarks(struct zoneinfo *zi,
     }
 }
 
+int64_t get_zone_pgskip_deltas_val(const char* name, int64_t *pgskip_deltas) {
+    int idx;
+
+    for (idx = 0; idx < VS_FIELD_COUNT; idx++) {
+        if (strcasestr(vmstat_field_names[idx], name) != NULL)
+            break;
+    }
+
+    if (idx == VS_FIELD_COUNT)
+        return -2;
+
+    return pgskip_deltas[PGSKIP_IDX(idx)];
+
+}
+
 void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t *pgskip_deltas) {
     struct zone_watermarks *watermarks;
+    char zone_name[LINE_MAX];
+    int64_t pgskip_deltas_val = -1;
 
     memset(zmi, 0, sizeof(struct zone_meminfo));
     watermarks = &zmi->watermarks;
@@ -3225,7 +3256,15 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
                 continue;
             }
 
-            if (!pgskip_deltas[PGSKIP_IDX(i++)]) {
+            strlcpy(zone_name, zone->name, LINE_MAX);
+            pgskip_deltas_val = get_zone_pgskip_deltas_val(zone_name, pgskip_deltas);
+
+            if (pgskip_deltas_val == -2)
+                pgskip_deltas_val = pgskip_deltas[PGSKIP_IDX(i++)];
+
+            ALOGE("%s pgskip_deltas_val: %" PRId64 " pgskip_deltas[PGSKIP_IDX(i++)]: %" PRId64, __func__, pgskip_deltas_val, pgskip_deltas[PGSKIP_IDX(i++)]);
+
+            if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
                 watermarks->high_wmark += zone->max_protection + zone->fields.field.high;
