@@ -3190,10 +3190,10 @@ struct zone_meminfo {
 
 };
 
-static bool should_consider_cache_free(uint32_t events, enum vmpressure_level level)
+static bool should_consider_cache_free(enum vmpressure_level level)
 {
     if (cache_percent) {
-        return events? level < VMPRESS_LEVEL_CRITICAL : true;
+        return level < VMPRESS_LEVEL_CRITICAL;
     }
     return false;
 }
@@ -3202,7 +3202,7 @@ static bool should_consider_cache_free(uint32_t events, enum vmpressure_level le
  * Returns lowest breached watermark or WMARK_NONE.
  */
 static enum zone_watermark get_lowest_watermark(union meminfo *mi,
-                                                struct zone_meminfo *zmi, enum vmpressure_level level, uint32_t events)
+                                                struct zone_meminfo *zmi, enum vmpressure_level level)
 {
     struct zone_watermarks *watermarks = &zmi->watermarks;
     int64_t nr_free_pages = zmi->nr_free_pages - zmi->cma_free;
@@ -3211,7 +3211,7 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     int64_t breached_wm_level = 0;
     zone_watermark zm_breached = WMARK_NONE;
 
-    if (should_consider_cache_free(events, level)) {
+    if (should_consider_cache_free(level)) {
         file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem;
         nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
@@ -3621,7 +3621,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     calc_zone_watermarks(&zi, &zone_mem_info, pgskip_deltas);
 
     /* Find out which watermark is breached if any */
-    wmark = get_lowest_watermark(&mi, &zone_mem_info, level, events);
+    wmark = get_lowest_watermark(&mi, &zone_mem_info, level);
     log_meminfo(&mi);
     if (level < VMPRESS_LEVEL_CRITICAL && (reclaim == DIRECT_RECLAIM ||
             reclaim == DIRECT_RECLAIM_THROTTLE)) {
