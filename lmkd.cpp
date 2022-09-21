@@ -71,19 +71,17 @@
 #define ATRACE_TAG ATRACE_TAG_ALWAYS
 #include <cutils/trace.h>
 
-static inline void trace_kill_start(int pid, const char *desc) {
-    ATRACE_INT("kill_one_process", pid);
+static inline void trace_kill_start(const char *desc) {
     ATRACE_BEGIN(desc);
 }
 
 static inline void trace_kill_end() {
     ATRACE_END();
-    ATRACE_INT("kill_one_process", 0);
 }
 
 #else /* LMKD_TRACE_KILLS */
 
-static inline void trace_kill_start(int, const char *) {}
+static inline void trace_kill_start(const char *) {}
 static inline void trace_kill_end() {}
 
 #endif /* LMKD_TRACE_KILLS */
@@ -2013,7 +2011,7 @@ static bool meminfo_parse_line(char *line, union meminfo *mi) {
 
 static int64_t read_gpu_total_kb() {
     static int fd = android::bpf::bpfFdGet(
-            "/sys/fs/bpf/map_gpu_mem_gpu_mem_total_map", BPF_F_RDONLY);
+            "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map", BPF_F_RDONLY);
     static constexpr uint64_t kBpfKeyGpuTotalUsage = 0;
     uint64_t value;
 
@@ -2764,6 +2762,8 @@ static void watchdog_callback() {
         if (reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
             ALOGW("lmkd watchdog killed process %d, oom_score_adj %d", target.pid, oom_score);
             killinfo_log(&target, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
+            // WARNING: do not use target after pid_remove()
+            pid_remove(target.pid);
             break;
         }
         prev_pid = target.pid;
@@ -2942,7 +2942,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
       return result;
     }
 
-    trace_kill_start(pid, desc);
+    trace_kill_start(desc);
 
     start_wait_for_proc_kill(pidfd < 0 ? pid : pidfd);
     kill_result = reaper.kill({ pidfd, pid, uid }, false);
