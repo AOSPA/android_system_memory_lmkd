@@ -3576,11 +3576,13 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
               }
               last_pa_update_tm = curr_tm;
         }
-    } else if (!in_compaction) {
-        /* Skip if system is not reclaiming */
-        ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim",
-                 level_name[level]);
-        goto no_kill;
+
+        if (!in_compaction) {
+            /* Skip if system is not reclaiming */
+            ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim or compaction and no refaults",
+                     level_name[level]);
+            goto no_kill;
+        }
     }
 
     if (debug_process_killing) {
