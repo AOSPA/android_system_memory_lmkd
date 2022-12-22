@@ -220,6 +220,7 @@ static struct timespec last_kill_tm;
 /* lmkd configurable parameters */
 static bool is_userdebug_or_eng_build;
 static bool debug_process_killing;
+static float cache_percent;
 static bool enable_pressure_upgrade;
 static int64_t upgrade_pressure;
 static int64_t downgrade_pressure;
@@ -251,6 +252,7 @@ static int count_upgraded_event;
 static long pa_update_timeout_ms = 60000; /* 1 min */
 static int kpoll_fd;
 static int psi_cont_event_thresh = PSI_CONT_EVENT_THRESH;
+static bool use_perf_api_for_pref_apps;
 /* PSI window related variables */
 static int psi_window_size_ms = PSI_WINDOW_SIZE_MS;
 static int psi_poll_period_scrit_ms = PSI_POLL_PERIOD_SHORT_MS;
@@ -382,6 +384,7 @@ struct zoneinfo_zone {
     union zoneinfo_zone_fields fields;
     int64_t protection[MAX_NR_ZONES];
     int64_t max_protection;
+    char name[LINE_MAX];
 };
 
 /* zoneinfo per-node fields */
@@ -495,6 +498,7 @@ union meminfo {
         /* fields below are calculated rather than read from the file */
         int64_t nr_file_pages;
         int64_t total_gpu_kb;
+        int64_t easy_available;
     } field;
     int64_t arr[MI_FIELD_COUNT];
 };
@@ -590,6 +594,7 @@ struct proc {
     uid_t uid;
     int oomadj;
     pid_t reg_pid; /* PID of the process that registered this record */
+    bool valid;
     struct proc *pidhash_next;
 };
 
@@ -605,9 +610,11 @@ typedef struct {
 
 #define PREFERRED_OUT_LENGTH 12288
 #define PAPP_OPCODE 10
+#define PAPP_PERF_TRIGGER 0x00001607
 
 char *preferred_apps;
 void (*perf_ux_engine_trigger)(int, char *) = NULL;
+const char * (*perf_sync_request)(int) = NULL;
 
 #define PIDHASH_SZ 1024
 static struct proc *pidhash[PIDHASH_SZ];
@@ -647,6 +654,10 @@ static long page_k = PAGE_SIZE / 1024;
 
 static void init_PreferredApps();
 static void update_perf_props();
+static void create_handle_for_perf_iop();
+static void close_handle_for_perf_iop();
+static void * handle_iopd = NULL;
+static void * handle_perfd = NULL;
 
 static bool update_props();
 static bool init_monitors();
@@ -1043,6 +1054,7 @@ static void proc_insert(struct proc *procp) {
     proc_slot(procp);
 }
 
+// Can be called only from the main thread.
 static int pid_remove(int pid) {
     int hval = pid_hashfn(pid);
     struct proc *procp;
@@ -1076,6 +1088,15 @@ static int pid_remove(int pid) {
     }
 
     return 0;
+}
+
+static void pid_invalidate(int pid) {
+    std::shared_lock lock(adjslot_list_lock);
+    struct proc *procp = pid_lookup(pid);
+
+    if (procp) {
+        procp->valid = false;
+    }
 }
 
 /*
@@ -1405,6 +1426,7 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
         procp->uid = params.uid;
         procp->reg_pid = cred->pid;
         procp->oomadj = params.oomadj;
+        procp->valid = true;
         proc_insert(procp);
     } else {
         if (!claim_record(procp, cred->pid)) {
@@ -1873,7 +1895,7 @@ static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone) {
     return false;
 }
 
-static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
+static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node, char *name) {
     int fields_to_match = ZI_NODE_FIELD_COUNT;
 
     for (char *line = strtok_r(NULL, "\n", buf); line;
@@ -1883,7 +1905,19 @@ static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
         char *save_ptr;
         int64_t val;
         int field_idx;
+        char zone_name[LINE_MAX + 1];
         enum field_match_result match_res;
+
+        /*
+         * Empty zones would not have per-zone stats, so we might come across a
+         * new zone next. Update zone_name and continue parsing.
+         */
+        if (sscanf(line, "Node %d, zone %" STRINGIFY(LINE_MAX) "s", &node->id, zone_name) == 2) {
+            ALOGE("%s per-node stats not found in zone %s; moving to next zone", __func__, name);
+
+            /* update zone name to be used in struct zoneinfo_zone.name */
+            strlcpy(name, zone_name, LINE_MAX);
+        }
 
         cp = strtok_r(line, " ", &save_ptr);
         if (!cp) {
@@ -1948,7 +1982,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 node = &zi->nodes[node_idx];
                 node->id = node_id;
                 zone_idx = 0;
-                if (!zoneinfo_parse_node(&save_ptr, node)) {
+                if (!zoneinfo_parse_node(&save_ptr, node, zone_name)) {
                     ALOGE("%s parse error", file_data.filename);
                     return -1;
                 }
@@ -1960,6 +1994,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 ALOGE("%s parse error", file_data.filename);
                 return -1;
             }
+            strlcpy(node->zones[zone_idx].name, zone_name, LINE_MAX);
         }
     }
     if (!node) {
@@ -2049,8 +2084,17 @@ static int meminfo_parse(union meminfo *mi) {
     mi->field.nr_file_pages = mi->field.cached + mi->field.swap_cached +
         mi->field.buffers;
     mi->field.total_gpu_kb = read_gpu_total_kb();
+    mi->field.easy_available = mi->field.nr_free_pages + mi->field.inactive_file;
 
     return 0;
+}
+
+// In the case of ZRAM, mi->field.free_swap can't be used directly because swap space is taken
+// from the free memory or reclaimed. Use the lowest of free_swap and easily available memory to
+// measure free swap because they represent how much swap space the system will consider to use
+// and how much it can actually use.
+static inline int64_t get_free_swap(union meminfo *mi) {
+    return std::min(mi->field.free_swap, mi->field.easy_available);
 }
 
 /* /proc/vmstat parsing routines */
@@ -2569,7 +2613,7 @@ static struct proc *proc_adj_prev(int oomadj, int pid) {
     return NULL;
 }
 
-// When called from a non-main thread, adjslot_list_lock read lock should be taken.
+// Can be called only from the main thread.
 static struct proc *proc_get_heaviest(int oomadj) {
     struct adjslot_list *head = &procadjslot_list[ADJTOSLOT(oomadj)];
     struct adjslot_list *curr = head->next;
@@ -2759,11 +2803,11 @@ static void watchdog_callback() {
             continue;
         }
 
-        if (reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
+        if (target.valid && reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
             ALOGW("lmkd watchdog killed process %d, oom_score_adj %d", target.pid, oom_score);
             killinfo_log(&target, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
-            // WARNING: do not use target after pid_remove()
-            pid_remove(target.pid);
+            // Can't call pid_remove() from non-main thread, therefore just invalidate the record
+            pid_invalidate(target.pid);
             break;
         }
         prev_pid = target.pid;
@@ -2901,7 +2945,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     static char buf[PAGE_SIZE];
     char desc[LINE_MAX];
 
-    if (!read_proc_status(pid, buf, sizeof(buf))) {
+    if (!procp->valid || !read_proc_status(pid, buf, sizeof(buf))) {
         goto out;
     }
     if (!parse_status_tag(buf, PROC_STATUS_TGID_FIELD, &tgid)) {
@@ -2981,7 +3025,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     kill_st.oom_score = procp->oomadj;
     kill_st.min_oom_score = min_oom_score;
     kill_st.free_mem_kb = mi->field.nr_free_pages * page_k;
-    kill_st.free_swap_kb = mi->field.free_swap * page_k;
+    kill_st.free_swap_kb = get_free_swap(mi) * page_k;
     stats_write_lmk_kill_occurred(&kill_st, mem_st);
 
     ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid);
@@ -3132,22 +3176,36 @@ struct zone_meminfo {
 
 };
 
+static bool should_consider_cache_free(uint32_t events, enum vmpressure_level level)
+{
+    if (cache_percent) {
+        return events? level < VMPRESS_LEVEL_CRITICAL : true;
+    }
+    return false;
+}
+
 /*
  * Returns lowest breached watermark or WMARK_NONE.
  */
-static enum zone_watermark get_lowest_watermark(union meminfo *mi __unused,
-                                                struct zone_meminfo *zmi)
+static enum zone_watermark get_lowest_watermark(union meminfo *mi,
+                                                struct zone_meminfo *zmi, enum vmpressure_level level, uint32_t events)
 {
     struct zone_watermarks *watermarks = &zmi->watermarks;
     int64_t nr_free_pages = zmi->nr_free_pages - zmi->cma_free;
+    int64_t nr_cached_pages = 0;
+    int64_t file_cache;
 
-    if (nr_free_pages < watermarks->min_wmark) {
+    if (should_consider_cache_free(events, level)) {
+        file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem;
+        nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
+    }
+    if (nr_free_pages + nr_cached_pages < watermarks->min_wmark) {
         return WMARK_MIN;
     }
-    if (nr_free_pages < wbf_effective * watermarks->low_wmark) {
+    if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->low_wmark) {
         return WMARK_LOW;
     }
-    if (nr_free_pages < wbf_effective * watermarks->high_wmark) {
+    if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->high_wmark) {
         return WMARK_HIGH;
     }
     return WMARK_NONE;
@@ -3184,8 +3242,25 @@ static void log_zone_watermarks(struct zoneinfo *zi,
     }
 }
 
+int64_t get_zone_pgskip_deltas_val(const char* name, int64_t *pgskip_deltas) {
+    int idx;
+
+    for (idx = 0; idx < VS_FIELD_COUNT; idx++) {
+        if (strcasestr(vmstat_field_names[idx], name) != NULL)
+            break;
+    }
+
+    if (idx == VS_FIELD_COUNT)
+        return -2;
+
+    return pgskip_deltas[PGSKIP_IDX(idx)];
+
+}
+
 void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t *pgskip_deltas) {
     struct zone_watermarks *watermarks;
+    char zone_name[LINE_MAX];
+    int64_t pgskip_deltas_val = -1;
 
     memset(zmi, 0, sizeof(struct zone_meminfo));
     watermarks = &zmi->watermarks;
@@ -3203,7 +3278,15 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
                 continue;
             }
 
-            if (!pgskip_deltas[PGSKIP_IDX(i++)]) {
+            strlcpy(zone_name, zone->name, LINE_MAX);
+            pgskip_deltas_val = get_zone_pgskip_deltas_val(zone_name, pgskip_deltas);
+
+            if (pgskip_deltas_val == -2)
+                pgskip_deltas_val = pgskip_deltas[PGSKIP_IDX(i++)];
+
+            ALOGE("%s pgskip_deltas_val: %" PRId64 " pgskip_deltas[PGSKIP_IDX(i++)]: %" PRId64, __func__, pgskip_deltas_val, pgskip_deltas[PGSKIP_IDX(i++)]);
+
+            if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
                 watermarks->high_wmark += zone->max_protection + zone->fields.field.high;
@@ -3264,7 +3347,7 @@ static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_
 }
 
 static int calc_swap_utilization(union meminfo *mi) {
-    int64_t swap_used = mi->field.total_swap - mi->field.free_swap;
+    int64_t swap_used = mi->field.total_swap - get_free_swap(mi);
     int64_t total_swappable = mi->field.active_anon + mi->field.inactive_anon +
                               mi->field.shmem + swap_used;
     return total_swappable > 0 ? (swap_used * 100) / total_swappable : 0;
@@ -3337,7 +3420,19 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (level == VMPRESS_LEVEL_MEDIUM) {
         if (enable_preferred_apps &&
                 (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
-            perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+            if (!use_perf_api_for_pref_apps) {
+                if (perf_ux_engine_trigger) {
+                    perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                }
+            } else {
+                if (perf_sync_request) {
+                    const char * tmp = perf_sync_request(PAPP_PERF_TRIGGER);
+                    if (tmp != NULL) {
+                        strlcpy(preferred_apps, tmp, strlen(tmp));
+                        free((void *)tmp);
+                    }
+                }
+            }
             last_pa_update_tm = curr_tm;
         }
     }
@@ -3401,7 +3496,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     /* Check free swap levels */
     if (swap_free_low_percentage) {
         swap_low_threshold = mi.field.total_swap * swap_free_low_percentage / 100;
-        swap_is_low = mi.field.free_swap < swap_low_threshold;
+        swap_is_low = get_free_swap(&mi) < swap_low_threshold;
     } else {
         swap_low_threshold = 0;
     }
@@ -3431,7 +3526,19 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     } else if (workingset_refault_file == prev_workingset_refault) {
         if (enable_preferred_apps &&
                   (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
-              perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+              if (!use_perf_api_for_pref_apps) {
+                  if (perf_ux_engine_trigger) {
+                      perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                  }
+              } else {
+                  if (perf_sync_request) {
+                      const char * tmp = perf_sync_request(PAPP_PERF_TRIGGER);
+                      if (tmp != NULL) {
+                          strlcpy(preferred_apps, tmp, strlen(tmp));
+                          free((void *)tmp);
+                      }
+                  }
+              }
               last_pa_update_tm = curr_tm;
         }
 
@@ -3497,7 +3604,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     calc_zone_watermarks(&zi, &zone_mem_info, pgskip_deltas);
 
     /* Find out which watermark is breached if any */
-    wmark = get_lowest_watermark(&mi, &zone_mem_info);
+    wmark = get_lowest_watermark(&mi, &zone_mem_info, level, events);
     log_meminfo(&mi, wmark);
     if (level < VMPRESS_LEVEL_CRITICAL && (reclaim == DIRECT_RECLAIM ||
             reclaim == DIRECT_RECLAIM_THROTTLE)) {
@@ -3555,7 +3662,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         kill_reason = LOW_SWAP_AND_THRASHING;
         snprintf(kill_desc, sizeof(kill_desc), "device is low on swap (%" PRId64
             "kB < %" PRId64 "kB) and thrashing (%" PRId64 "%%)",
-            mi.field.free_swap * page_k, swap_low_threshold * page_k, thrashing);
+            get_free_swap(&mi) * page_k, swap_low_threshold * page_k, thrashing);
         /* Do not kill perceptible apps unless below min watermark or heavily thrashing */
         if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
@@ -3566,7 +3673,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         kill_reason = LOW_MEM_AND_SWAP;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap is low (%"
             PRId64 "kB < %" PRId64 "kB)", wmark < WMARK_LOW ? "min" : "low",
-            mi.field.free_swap * page_k, swap_low_threshold * page_k);
+            get_free_swap(&mi) * page_k, swap_low_threshold * page_k);
         /* Do not kill perceptible apps unless below min watermark or heavily thrashing */
         if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
@@ -3938,7 +4045,19 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
         record_low_pressure_levels(&mi);
         if (enable_preferred_apps) {
             if (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms) {
-                perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                if (!use_perf_api_for_pref_apps) {
+                    if (perf_ux_engine_trigger) {
+                        perf_ux_engine_trigger(PAPP_OPCODE, preferred_apps);
+                    }
+                } else {
+                    if (perf_sync_request) {
+                        const char * tmp = perf_sync_request(PAPP_PERF_TRIGGER);
+                        if (tmp != NULL) {
+                            strlcpy(preferred_apps, tmp, strlen(tmp));
+                            free((void *)tmp);
+                        }
+                    }
+                }
                 last_pa_update_tm = curr_tm;
             }
         }
@@ -3971,7 +4090,7 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 
     // If we still have enough swap space available, check if we want to
     // ignore/downgrade pressure events.
-    if (mi.field.total_swap && (mi.field.free_swap >=
+    if (mi.field.total_swap && (get_free_swap(&mi) >=
         mi.field.total_swap * swap_free_low_percentage / 100)) {
         // If the pressure is larger than downgrade_pressure lmk will not
         // kill any process, since enough memory is available.
@@ -4784,25 +4903,44 @@ int issue_reinit() {
     return res == UPDATE_PROPS_SUCCESS ? 0 : -1;
 }
 
+static void create_handle_for_perf_iop() {
+    handle_perfd = dlopen(PERFD_LIB, RTLD_NOW);
+    handle_iopd = dlopen(IOPD_LIB, RTLD_NOW);
+}
+
+static void close_handle_for_perf_iop() {
+    if (handle_perfd != NULL) {
+        dlclose(handle_perfd);
+    }
+    if (handle_iopd != NULL) {
+        dlclose(handle_iopd);
+    }
+}
+
 static void init_PreferredApps() {
     void *handle = NULL;
-    handle = dlopen(IOPD_LIB, RTLD_NOW);
-    if (handle != NULL) {
-        perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle, "perf_ux_engine_trigger");
+    if (!use_perf_api_for_pref_apps) {
+        if (handle_iopd != NULL) {
+            perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle_iopd, "perf_ux_engine_trigger");
+        }
+    } else {
+        if (handle_perfd != NULL) {
+            perf_sync_request = (const char* (*)(int))dlsym(handle_perfd, "perf_sync_request");
+        }
+    }
 
-        if (!perf_ux_engine_trigger) {
-            ALOGE("Couldn't obtain perf_ux_engine_trigger");
+    if (perf_ux_engine_trigger || perf_sync_request) {
+        // Initialize preferred_apps
+        preferred_apps = (char *) malloc ( PREFERRED_OUT_LENGTH * sizeof(char));
+        if (preferred_apps == NULL) {
             enable_preferred_apps = false;
         } else {
-            // Initialize preferred_apps
-            preferred_apps = (char *) malloc ( PREFERRED_OUT_LENGTH * sizeof(char));
-            if (preferred_apps == NULL) {
-                enable_preferred_apps = false;
-            } else {
-                memset(preferred_apps, 0, PREFERRED_OUT_LENGTH);
-                preferred_apps[0] = '\0';
-            }
+            memset(preferred_apps, 0, PREFERRED_OUT_LENGTH);
+            preferred_apps[0] = '\0';
         }
+    } else {
+        ALOGE("Couldn't obtain API to obtain Preferred Apps");
+        enable_preferred_apps = false;
     }
 }
 
@@ -4815,10 +4953,9 @@ static void update_perf_props() {
 
     /* Loading the vendor library at runtime to access property value */
     PropVal (*perf_get_prop)(const char *, const char *) = NULL;
-    void *handle = NULL;
-    handle = dlopen(PERFD_LIB, RTLD_NOW);
-    if (handle != NULL) {
-        perf_get_prop = (PropVal (*)(const char *, const char *))dlsym(handle, "perf_get_prop");
+    create_handle_for_perf_iop();
+    if (handle_perfd != NULL) {
+        perf_get_prop = (PropVal (*)(const char *, const char *))dlsym(handle_perfd, "perf_get_prop");
     }
 
     if (!perf_get_prop) {
@@ -4925,12 +5062,18 @@ static void update_perf_props() {
         enable_watermark_check = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
         strlcpy(property, perf_get_prop("ro.lmk.enable_preferred_apps", "false").value, PROPERTY_VALUE_MAX);
         enable_preferred_apps = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
+        strlcpy(property, perf_get_prop("ro.vendor.use_perf_hal_for_preferredapps", "false").value, PROPERTY_VALUE_MAX);
+        use_perf_api_for_pref_apps = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
         snprintf(default_value, PROPERTY_VALUE_MAX, "%d", wmark_boost_factor);
         strlcpy(property,
             perf_get_prop("ro.lmk.nstrat_wmark_boost_factor", default_value).value,
             PROPERTY_VALUE_MAX);
         wmark_boost_factor = strtod(property, NULL);
         wbf_effective = wmark_boost_factor;
+
+        snprintf(default_value, PROPERTY_VALUE_MAX, "%f", cache_percent);
+        strlcpy(property, perf_get_prop("ro.lmk.cache_percent", default_value).value, PROPERTY_VALUE_MAX);
+        cache_percent = (float)(strtod(property, NULL) * 0.01);
 
         //Update kernel interface during re-init.
         use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
@@ -5057,7 +5200,7 @@ int main(int argc, char **argv) {
     }
 
     android_log_destroy(&ctx);
-
+    close_handle_for_perf_iop();
     ALOGI("exiting");
     return 0;
 }
