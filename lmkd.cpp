@@ -434,6 +434,7 @@ enum meminfo_field {
     MI_BUFFERS,
     MI_SHMEM,
     MI_UNEVICTABLE,
+    MI_MLOCKED,
     MI_TOTAL_SWAP,
     MI_FREE_SWAP,
     MI_ACTIVE_ANON,
@@ -458,6 +459,7 @@ static const char* const meminfo_field_names[MI_FIELD_COUNT] = {
     "Buffers:",
     "Shmem:",
     "Unevictable:",
+    "Mlocked:",
     "SwapTotal:",
     "SwapFree:",
     "Active(anon):",
@@ -482,6 +484,7 @@ union meminfo {
         int64_t buffers;
         int64_t shmem;
         int64_t unevictable;
+        int64_t mlocked;
         int64_t total_swap;
         int64_t free_swap;
         int64_t active_anon;
@@ -3183,10 +3186,22 @@ struct zone_meminfo {
 
 };
 
-static bool should_consider_cache_free(enum vmpressure_level level)
+static bool should_consider_cache_free(uint32_t events, enum vmpressure_level level, bool in_compaction)
 {
     if (cache_percent) {
-        return level < VMPRESS_LEVEL_CRITICAL;
+        if (in_compaction) {
+            //System is compacting memory. Happens during higher order allocations.
+            return false;
+        }
+        if (level < VMPRESS_LEVEL_CRITICAL) {
+            // For medium and low memory pressure events, consider cached pages as free.
+            return true;
+        }
+
+        if (!events && level == VMPRESS_LEVEL_CRITICAL) {
+            //for polled critical events, consider cached pages as free
+            return true;
+        }
     }
     return false;
 }
@@ -3195,7 +3210,8 @@ static bool should_consider_cache_free(enum vmpressure_level level)
  * Returns lowest breached watermark or WMARK_NONE.
  */
 static enum zone_watermark get_lowest_watermark(union meminfo *mi,
-                                                struct zone_meminfo *zmi, enum vmpressure_level level)
+                                                struct zone_meminfo *zmi, enum vmpressure_level level,
+                                                uint32_t events, bool in_compaction)
 {
     struct zone_watermarks *watermarks = &zmi->watermarks;
     int64_t nr_free_pages = zmi->nr_free_pages - zmi->cma_free;
@@ -3204,8 +3220,8 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     int64_t breached_wm_level = 0;
     zone_watermark zm_breached = WMARK_NONE;
 
-    if (should_consider_cache_free(level)) {
-        file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem;
+    if (should_consider_cache_free(events, level, in_compaction)) {
+        file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem - mi->field.mlocked - mi->field.swap_cached;
         nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
 
@@ -3325,10 +3341,12 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
 static void log_meminfo(union meminfo *mi)
 {
     if (debug_process_killing) {
-        ULMK_LOG(D, "nr_free_pages: %" PRId64 " active_anon: %" PRId64 " inactive_anon: %" PRId64
-             " cma_free: %" PRId64, mi->field.nr_free_pages,
-             mi->field.active_anon, mi->field.inactive_anon,
-             mi->field.cma_free);
+        ULMK_LOG(D, "nr_free_pages: %" PRId64 " Cached: %" PRId64 " Unevictable: %" PRId64
+             " Shmem: %" PRId64 " mlocked: %" PRId64 " SwapCached: %" PRId64
+             " active_anon: %" PRId64 " inactive_anon: %" PRId64 "cma_free: %" PRId64,
+             mi->field.nr_free_pages, mi->field.cached, mi->field.unevictable,
+             mi->field.shmem, mi->field.mlocked, mi->field.swap_cached,
+             mi->field.active_anon, mi->field.inactive_anon, mi->field.cma_free);
     }
 }
 
@@ -3554,10 +3572,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
 
         if (!in_compaction) {
             /* Skip if system is not reclaiming */
-            ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim",
+            ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim or compaction and no refaults",
                      level_name[level]);
             goto no_kill;
         }
+    }
+
+    if (debug_process_killing) {
+        ULMK_LOG(D, "reclaim: %d in_compaction : %d", reclaim, in_compaction);
     }
 
     prev_workingset_refault = workingset_refault_file;
@@ -3614,7 +3636,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     calc_zone_watermarks(&zi, &zone_mem_info, pgskip_deltas);
 
     /* Find out which watermark is breached if any */
-    wmark = get_lowest_watermark(&mi, &zone_mem_info, level);
+    wmark = get_lowest_watermark(&mi, &zone_mem_info, level, events, in_compaction);
     log_meminfo(&mi);
     if (level < VMPRESS_LEVEL_CRITICAL && (reclaim == DIRECT_RECLAIM ||
             reclaim == DIRECT_RECLAIM_THROTTLE)) {
