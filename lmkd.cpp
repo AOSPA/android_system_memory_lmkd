@@ -3228,7 +3228,7 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     zone_watermark zm_breached = WMARK_NONE;
 
     if (should_consider_cache_free(events, level, in_compaction)) {
-        file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem - mi->field.mlocked - mi->field.swap_cached;
+        file_cache = mi->field.active_file + mi->field.inactive_file;;
         nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
 
@@ -3307,6 +3307,10 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
     struct zone_watermarks *watermarks;
     char zone_name[LINE_MAX];
     int64_t pgskip_deltas_val = -1;
+    int64_t max_high = 0;
+    int64_t max_low = 0;
+    int64_t max_min = 0;
+    int64_t max_protection = 0;
 
     memset(zmi, 0, sizeof(struct zone_meminfo));
     watermarks = &zmi->watermarks;
@@ -3335,11 +3339,18 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
             if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
-                watermarks->high_wmark += zone->max_protection + zone->fields.field.high;
-                watermarks->low_wmark += zone->max_protection + zone->fields.field.low;
-                watermarks->min_wmark += zone->max_protection + zone->fields.field.min;
+
+                max_high = std::max(max_high, zone->fields.field.high);
+                max_low = std::max(max_low, zone->fields.field.low);
+                max_min = std::max(max_min, zone->fields.field.min);
+                max_protection = std::max(max_protection, zone->max_protection);
             }
         }
+
+        // Kernel watermarks are per zone. But LMK operates on a single watermark. So, consider only the worst case of zone watermark.
+        watermarks->high_wmark = max_high + max_protection;
+        watermarks->low_wmark = max_low + max_protection;
+        watermarks->min_wmark = max_min + max_protection;
     }
 
     log_zone_watermarks(zi);
@@ -3350,7 +3361,7 @@ static void log_meminfo(union meminfo *mi)
     if (debug_process_killing) {
         ULMK_LOG(D, "nr_free_pages: %" PRId64 " Cached: %" PRId64 " Unevictable: %" PRId64
              " Shmem: %" PRId64 " mlocked: %" PRId64 " SwapCached: %" PRId64
-             " active_anon: %" PRId64 " inactive_anon: %" PRId64 "cma_free: %" PRId64,
+             " active_anon: %" PRId64 " inactive_anon: %" PRId64 " cma_free: %" PRId64,
              mi->field.nr_free_pages, mi->field.cached, mi->field.unevictable,
              mi->field.shmem, mi->field.mlocked, mi->field.swap_cached,
              mi->field.active_anon, mi->field.inactive_anon, mi->field.cma_free);
