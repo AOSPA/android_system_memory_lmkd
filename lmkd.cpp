@@ -2362,6 +2362,13 @@ static int parse_one_zone_watermark(char *buf, struct watermark_info *w)
         }
     }
 
+    /* This is an empty zone. there won't be any further fields.
+       So skip the rest of the items in Zone*/
+    if (w->present == 0) {
+        ret = buf - start;
+        return ret;
+    }
+
     while(*buf) {
         nargs = sscanf(buf,
                     " nr_zone_inactive_anon %d"
