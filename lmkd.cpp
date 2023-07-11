@@ -341,6 +341,8 @@ enum zoneinfo_zone_field {
     ZI_ZONE_HIGH,
     ZI_ZONE_PRESENT,
     ZI_ZONE_NR_FREE_CMA,
+    ZI_ZONE_NR_INACTIVE_FILE,
+    ZI_ZONE_NR_ACTIVE_FILE,
     ZI_ZONE_FIELD_COUNT
 };
 
@@ -351,6 +353,8 @@ static const char* const zoneinfo_zone_field_names[ZI_ZONE_FIELD_COUNT] = {
     "high",
     "present",
     "nr_free_cma",
+    "nr_zone_inactive_file",
+    "nr_zone_active_file",
 };
 
 /* zoneinfo per-zone special fields */
@@ -376,6 +380,8 @@ union zoneinfo_zone_fields {
         int64_t high;
         int64_t present;
         int64_t nr_free_cma;
+        int64_t nr_zone_inactive_file;
+        int64_t nr_zone_active_file;
     } field;
     int64_t arr[ZI_ZONE_FIELD_COUNT];
 };
@@ -3189,6 +3195,8 @@ struct zone_watermarks {
 struct zone_meminfo {
     int64_t nr_free_pages;
     int64_t cma_free;
+    int64_t nr_zone_inactive_file;
+    int64_t nr_zone_active_file;
     struct zone_watermarks watermarks;
 
 };
@@ -3228,7 +3236,7 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     zone_watermark zm_breached = WMARK_NONE;
 
     if (should_consider_cache_free(events, level, in_compaction)) {
-        file_cache = mi->field.active_file + mi->field.inactive_file;;
+        file_cache = zmi->nr_zone_inactive_file + zmi->nr_zone_active_file;
         nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
 
@@ -3278,12 +3286,15 @@ static void log_zone_watermarks(struct zoneinfo *zi) {
 
             ULMK_LOG(D, "Zone: %d nr_free_pages: %" PRId64 " min: %" PRId64
                  " low: %" PRId64 " high: %" PRId64 " present: %" PRId64
-                 " nr_cma_free: %" PRId64 " max_protection: %" PRId64,
+                 " nr_cma_free: %" PRId64 " max_protection: %" PRId64
+                 " nr_zone_inactive_file: %" PRId64 " nr_zone_active_file: %" PRId64,
                  j, zone_fields->field.nr_free_pages,
                  zone_fields->field.min, zone_fields->field.low,
                  zone_fields->field.high, zone_fields->field.present,
                  zone_fields->field.nr_free_cma,
-                 node->zones[j].max_protection);
+                 node->zones[j].max_protection,
+                 zone_fields->field.nr_zone_inactive_file,
+                 zone_fields->field.nr_zone_active_file);
         }
     }
 }
@@ -3339,6 +3350,8 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
             if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
+                zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
+                zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
 
                 max_high = std::max(max_high, zone->fields.field.high);
                 max_low = std::max(max_low, zone->fields.field.low);
@@ -3382,7 +3395,7 @@ static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_
     }
 
     if (debug_process_killing) {
-        ULMK_LOG(D, "pgskip deltas: DMA: %" PRId64 "DMA32: %" PRId64 " Normal: %" PRId64 " High: %"
+        ULMK_LOG(D, "pgskip deltas: DMA: %" PRId64 " DMA32: %" PRId64 " Normal: %" PRId64 " High: %"
              PRId64 " Movable: %" PRId64,
              pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_DMA)],
              pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_DMA32)],
