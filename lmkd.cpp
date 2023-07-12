@@ -93,6 +93,7 @@ static inline void trace_kill_end() {}
 #define ZONEINFO_PATH "/proc/zoneinfo"
 #define MEMINFO_PATH "/proc/meminfo"
 #define VMSTAT_PATH "/proc/vmstat"
+#define LRUGEN_STATUS_PATH "/sys/kernel/mm/lru_gen/enabled"
 #define PROC_STATUS_TGID_FIELD "Tgid:"
 #define TRACE_MARKER_PATH "/sys/kernel/tracing/trace_marker"
 #define PROC_STATUS_RSS_FIELD "VmRSS:"
@@ -268,6 +269,7 @@ static int wbf_step = 1, wbf_effective = 1;
 static android_log_context ctx;
 static Reaper reaper;
 static int reaper_comm_fd[2];
+static int32_t MGLRU_status = 0;
 
 enum polling_update {
     POLLING_DO_NOT_CHANGE,
@@ -3381,6 +3383,27 @@ static void log_meminfo(union meminfo *mi)
     }
 }
 
+int32_t get_MGLRU_status() {
+    static struct reread_data file_data = {
+        .filename = LRUGEN_STATUS_PATH,
+        .fd = -1,
+    };
+    char *buf;
+
+    if ((buf = reread_file(&file_data)) == NULL) {
+        return MGLRU_status;
+    }
+
+    buf[16] = '\0'; //this cannot be more than 15 characters.
+    MGLRU_status = (int32_t)strtol(buf, NULL, 16);
+
+    if (debug_process_killing) {
+        ALOGD("MGLRU status : %d", MGLRU_status);
+    }
+
+    return MGLRU_status;
+}
+
 static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_t *pgskip_deltas)
 {
     unsigned int i;
@@ -3392,6 +3415,14 @@ static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_
         } else {
             pgskip_deltas[PGSKIP_IDX(i)] = -1;
         }
+    }
+
+    if (MGLRU_status > 0) {
+        /* When MGLRU is enabled, don't set the pgskip delta for Normal zone.
+           Because it could be because of page-isolation failure as well.
+           In which case, we need to consider Normal Zone watermarks and
+           free memory values for making kill decisions. */
+        pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_NORMAL)] = 0;
     }
 
     if (debug_process_killing) {
@@ -5205,6 +5236,9 @@ static void update_perf_props() {
     if (enable_preferred_apps) {
         init_PreferredApps();
     }
+
+    MGLRU_status = get_MGLRU_status();
+
     printLMKDConfigs();
 }
 
