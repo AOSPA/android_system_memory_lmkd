@@ -4994,6 +4994,64 @@ static void init_PreferredApps() {
     }
 }
 
+static void printLMKDConfigs() {
+    if (!debug_process_killing) {
+        return;
+    }
+
+    ALOGD("Configs :      enable_userspace_lmk : %5s,         use_old_strategy : %5s",
+           enable_userspace_lmk ? "true" : "false",
+           force_use_old_strategy ? "true" : "false");
+    ALOGD("Configs :        kill_heaviest_task : %5s,    enable_preferred_apps : %5s, "
+          "use_perf_api_for_pref_apps : %s",
+           kill_heaviest_task ? "true" : "false",
+           enable_preferred_apps ? "true" : "false",
+           use_perf_api_for_pref_apps ? "true" : "false");
+    ALOGD("Configs :        psi_window_size_ms : %5d, psi_poll_period_scrit_ms : %5d",
+           psi_window_size_ms, psi_poll_period_scrit_ms);
+    ALOGD("Configs : Thresholds       - medium : %5d,                 critical : %5d,"
+          "             super critical : %5d",
+           psi_thresholds[VMPRESS_LEVEL_MEDIUM].threshold_ms,
+           psi_thresholds[VMPRESS_LEVEL_CRITICAL].threshold_ms,
+           psi_thresholds[VMPRESS_LEVEL_SUPER_CRITICAL].threshold_ms);
+    ALOGD("Configs :           kill_timeout_ms : %5lu", kill_timeout_ms);
+    ALOGD("Configs : is_userdebug_or_eng_build : %5s,           low_ram_device : %5s,"
+          "              per_app_memcg : %5s",
+           is_userdebug_or_eng_build ? "true" : "false",
+           low_ram_device ? "true" : "false",
+           per_app_memcg ? "true" : "false");
+    if (force_use_old_strategy) {
+        ALOGD("Configs :       enable_adaptive_lmk : %5s,       use_minfree_levels : %5s,"
+              "     enable_watermark_check : %s",
+               enable_adaptive_lmk ? "true" : "false",
+               use_minfree_levels ? "true" : "false",
+               enable_watermark_check ? "true" : "false");
+        ALOGD("Configs :  swap_free_low_percentage : %5d", swap_free_low_percentage);
+        ALOGD("Configs :   enable_pressure_upgrade : %5s,         upgrade_pressure : %ld,"
+              "         downgrade_pressure : %ld",
+               enable_pressure_upgrade ? "true" : "false",
+               (long)upgrade_pressure, (long)downgrade_pressure);
+        ALOGD("Configs :   direct_reclaim_pressure : %5d,   reclaim_scan_threshold : %5d",
+               direct_reclaim_pressure, reclaim_scan_threshold);
+        ALOGD("Configs : OOM adj levels for    low : %5d,  medium : %5d,  critical : %5d,"
+              "             super critical : %5d",
+               level_oomadj[VMPRESS_LEVEL_LOW],
+               level_oomadj[VMPRESS_LEVEL_MEDIUM],
+               level_oomadj[VMPRESS_LEVEL_CRITICAL],
+               level_oomadj[VMPRESS_LEVEL_SUPER_CRITICAL]);
+    } else {
+        ALOGD("Configs :  swap_free_low_percentage : %5d,            swap_util_max : %5d",
+               swap_free_low_percentage, swap_util_max);
+        ALOGD("Configs :       thrashing_limit_pct : %5d,   thrashing_critical_pct : %5d,"
+              "  thrashing_limit_decay_pct : %5d",
+               thrashing_limit_pct, thrashing_critical_pct, thrashing_limit_decay_pct);
+        ALOGD("Configs :     psi_cont_event_thresh : %5d,     stall_limit_critical : %5ld,"
+              "           filecache_min_kb : %5ld",
+               psi_cont_event_thresh, (long)stall_limit_critical, (long)filecache_min_kb);
+        ALOGD("Configs :        wmark_boost_factor : %5d,            cache_percent : %f",
+               wmark_boost_factor, cache_percent);
+    }
+}
 static void update_perf_props() {
 
     enable_watermark_check =
@@ -5134,6 +5192,7 @@ static void update_perf_props() {
     if (enable_preferred_apps) {
         init_PreferredApps();
     }
+    printLMKDConfigs();
 }
 
 static bool update_props() {
