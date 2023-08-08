@@ -521,6 +521,7 @@ enum vmstat_field {
     VS_ACTIVE_FILE,
     VS_WORKINGSET_REFAULT,
     VS_WORKINGSET_REFAULT_FILE,
+    VS_PGREFILL,
     VS_PGSCAN_KSWAPD,
     VS_PGSCAN_DIRECT,
     VS_PGSCAN_DIRECT_THROTTLE,
@@ -543,6 +544,7 @@ static const char* const vmstat_field_names[VS_FIELD_COUNT] = {
     "nr_active_file",
     "workingset_refault",
     "workingset_refault_file",
+    "pgrefill",
     "pgscan_kswapd",
     "pgscan_direct",
     "pgscan_direct_throttle",
@@ -561,6 +563,7 @@ union vmstat {
         int64_t nr_active_file;
         int64_t workingset_refault;
         int64_t workingset_refault_file;
+        int64_t pgrefill;
         int64_t pgscan_kswapd;
         int64_t pgscan_direct;
         int64_t pgscan_direct_throttle;
@@ -3447,12 +3450,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
+        PGREFILL,
         DIRECT_RECLAIM,
         DIRECT_RECLAIM_THROTTLE,
     };
     static int64_t init_ws_refault;
     static int64_t prev_workingset_refault;
     static int64_t base_file_lru;
+    static int64_t init_pgrefill;
     static int64_t init_pgscan_kswapd;
     static int64_t init_pgscan_direct;
     static int64_t init_direct_throttle;
@@ -3568,13 +3573,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (debug_process_killing) {
         ULMK_LOG(D, "nr_free_pages: %" PRId64 " nr_inactive_file: %" PRId64
              " nr_active_file: %" PRId64  " workingset_refault: %" PRId64
+             " pgrefill: %" PRId64
              " pgscan_kswapd: %" PRId64 " pgscan_direct: %" PRId64
              " pgscan_direct_throttle: %" PRId64 " init_pgscan_direct: %" PRId64
              " init_pgscan_kswapd: %" PRId64 " base_file_lru: %" PRId64
              " init_ws_refault: %" PRId64 " free_swap: %" PRId64
              " total_swap: %" PRId64 " swap_free_percentage: %" PRId64 "%%",
              vs.field.nr_free_pages, vs.field.nr_inactive_file,
-             vs.field.nr_active_file, vs.field.workingset_refault,
+             vs.field.nr_active_file, workingset_refault_file,
+             vs.field.pgrefill,
              vs.field.pgscan_kswapd, vs.field.pgscan_direct,
              vs.field.pgscan_direct_throttle, init_pgscan_direct,
              init_pgscan_kswapd, base_file_lru, init_ws_refault,
@@ -3600,6 +3607,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (vs.field.pgscan_direct != init_pgscan_direct) {
         init_pgscan_direct = vs.field.pgscan_direct;
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
+        init_pgrefill = vs.field.pgrefill;
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
@@ -3609,10 +3617,27 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         reclaim = DIRECT_RECLAIM_THROTTLE;
     } else if (vs.field.pgscan_kswapd != init_pgscan_kswapd) {
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
+        init_pgrefill = vs.field.pgrefill;
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
         reclaim = KSWAPD_RECLAIM;
+    } else if (vs.field.pgrefill != init_pgrefill) {
+        init_pgrefill = vs.field.pgrefill;
+        for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
+            init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
+        }
+        /*
+         * On a system with only 2 zones, pgrefill indicating that pages are not eligible.
+         * Then there may be real refilling happens for normal zone pages too.
+         *
+         * This makes to consider only normal zone stats when system is under reclaim, under
+         * calc_zone_watermarks.
+         */
+        if (MGLRU_status) {
+            pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_MOVABLE)] = 1;
+        }
+        reclaim = PGREFILL;
     } else if (workingset_refault_file == prev_workingset_refault) {
         if (enable_preferred_apps &&
                   (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
