@@ -104,6 +104,7 @@ static inline void trace_kill_end() {}
 #define PERCEPTIBLE_APP_ADJ 200
 #define VISIBLE_APP_ADJ 100
 #define PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ 50
+#define PREVIOUS_APP_ADJ 700
 
 /* Android Logger event logtags (see event.logtags) */
 #define KILLINFO_LOG_TAG 10195355
@@ -3847,6 +3848,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         kill_reason = COMPACTION;
         strlcpy(kill_desc, "device is in compaction and low on memory", sizeof(kill_desc));
         min_score_adj = VISIBLE_APP_ADJ;
+    }
+
+    /* Check if a cached app should be killed */
+    if (kill_reason == NONE && wmark < WMARK_HIGH) {
+        /* TODO: introduce a new kill reason */
+        kill_reason = LOW_MEM_AND_SWAP;
+        snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached",
+            wmark < WMARK_LOW ? "min" : "low");
+        min_score_adj = PREVIOUS_APP_ADJ + 1;
     }
 
     /* Kill a process if necessary */
