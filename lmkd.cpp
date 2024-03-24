@@ -667,7 +667,7 @@ static bool s_crit_event_upgraded = false;
  * Initialize this as we decide the window size based on ram size for
  * lowram targets on old strategy.
  */
-static long page_k = PAGE_SIZE / 1024;
+static long page_k = -1;
 
 static void init_PreferredApps();
 static void update_perf_props();
@@ -750,7 +750,7 @@ static ssize_t read_all(int fd, char *buf, size_t max_len)
  */
 static char *reread_file(struct reread_data *data) {
     /* start with page-size buffer and increase if needed */
-    static ssize_t buf_size = PAGE_SIZE;
+    static ssize_t buf_size = getpagesize();
     static char *new_buf, *buf = NULL;
     ssize_t size;
 
@@ -971,7 +971,7 @@ static void poll_kernel(int poll_fd) {
         if (fields_read == 10 && group_leader_pid == pid) {
             ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid);
             mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
-            mem_st.rss_in_bytes = rss_in_pages * PAGE_SIZE;
+            mem_st.rss_in_bytes = rss_in_pages * getpagesize();
 
             struct kill_stat kill_st = {
                 .uid = static_cast<int32_t>(uid),
@@ -1212,7 +1212,7 @@ static bool parse_vmswap(char *buf, long *data) {
 }
 
 static long proc_get_swap(int pid) {
-    static char buf[PAGE_SIZE] = {0, };
+    static char buf[BUF_MAX] = {0, };
     static char path[PATH_MAX] = {0, };
     ssize_t ret;
     char *c, *save_ptr;
@@ -1315,7 +1315,7 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
     bool is_system_server;
     struct passwd *pwdrec;
     int64_t tgid;
-    char buf[PAGE_SIZE];
+    char buf[BUF_MAX];
 
     lmkd_pack_get_procprio(packet, field_count, &params);
 
@@ -2413,7 +2413,7 @@ static int parse_one_zone_watermark(char *buf, struct watermark_info *w)
 
 static void trace_log(const char *fmt, ...)
 {
-    char buf[PAGE_SIZE];
+    char buf[BUF_MAX];
     va_list ap;
     static int fd = -1;
     ssize_t len, ret;
@@ -2968,7 +2968,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int64_t tgid;
     int64_t rss_kb;
     int64_t swap_kb;
-    char buf[PAGE_SIZE];
+    char buf[BUF_MAX];
     char desc[LINE_MAX];
 
     if (!procp->valid || !read_proc_status(pid, buf, sizeof(buf))) {
@@ -4559,7 +4559,7 @@ static void update_psi_window_size() {
             /*
              * Set the optimal settings for lowram targets.
              */
-            if (info.field.nr_total_pages < (int64_t)(SZ_4G / PAGE_SIZE)) {
+            if (info.field.nr_total_pages < (int64_t)(SZ_4G / getpagesize())) {
                 if (psi_window_size_ms > 500) {
                     psi_window_size_ms = 500;
                     ULMK_LOG(I, "PSI window size is changed to %dms\n", psi_window_size_ms);
@@ -4651,7 +4651,7 @@ static int init(void) {
 
     page_k = sysconf(_SC_PAGESIZE);
     if (page_k == -1)
-        page_k = PAGE_SIZE;
+        page_k = getpagesize();
     page_k /= 1024;
 
     update_psi_window_size();

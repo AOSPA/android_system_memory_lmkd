@@ -56,6 +56,11 @@ enum lmk_cmd {
  */
 #define LINE_MAX 128
 
+/*
+ * Max size of work buffer
+ */
+#define BUF_MAX 4096
+
 /* LMKD packet - first int is lmk_cmd followed by payload */
 typedef int LMKD_CTRL_PACKET[CTRL_PACKET_MAX_SIZE / sizeof(int)];
 
