@@ -40,8 +40,12 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <shared_mutex>
+#include <vector>
 
+#include <bpf/KernelUtils.h>
+#include <bpf/WaitForProgsLoaded.h>
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
 #include <liblmkd_utils.h>
@@ -50,6 +54,7 @@
 #include <log/log.h>
 #include <log/log_event_list.h>
 #include <log/log_time.h>
+#include <memevents/memevents.h>
 #include <private/android_filesystem_config.h>
 #include <processgroup/processgroup.h>
 #include <psi/psi.h>
@@ -212,6 +217,10 @@ struct psi_threshold {
     int threshold_ms;
 };
 
+/* Listener for direct reclaim state changes */
+static std::unique_ptr<android::bpf::memevents::MemEventListener> memevent_listener(nullptr);
+static struct timespec direct_reclaim_start_tm;
+
 static int level_oomadj[VMPRESS_LEVEL_COUNT];
 static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1, -1 };
 static bool pidfd_supported;
@@ -324,8 +333,9 @@ static struct event_handler_info vmpressure_hinfo[VMPRESS_LEVEL_COUNT];
 /*
  * 1 ctrl listen socket, 3 ctrl data socket, 3 memory pressure levels,
  * 1 lmk events + 1 fd to wait for process death + 1 fd to receive kill failure notifications
+ * + 1 fd to receive direct reclaim state change notifications
  */
-#define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1)
+#define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1 + 1)
 static int epollfd;
 static int maxevents;
 
@@ -3500,6 +3510,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
        (!poll_params->poll_handler || data >= poll_params->poll_handler->data)) {
            wbf_effective = wmark_boost_factor;
     }
+    bool in_direct_reclaim;
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
@@ -3599,8 +3610,12 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         in_compaction = true;
     }
 
+    in_direct_reclaim = memevent_listener ? (direct_reclaim_start_tm.tv_sec != 0 ||
+                                             direct_reclaim_start_tm.tv_nsec != 0)
+                                          : (vs.field.pgscan_direct != init_pgscan_direct);
+
     /* Identify reclaim state */
-    if (vs.field.pgscan_direct != init_pgscan_direct) {
+    if (in_direct_reclaim) {
         init_pgscan_direct = vs.field.pgscan_direct;
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
         init_pgrefill = vs.field.pgrefill;
@@ -4370,6 +4385,103 @@ static MemcgVersion memcg_version() {
     return version;
 }
 
+static void direct_reclaim_state_change(int data __unused, uint32_t events __unused,
+                                        struct polling_params* poll_params __unused) {
+    struct timespec curr_tm;
+    std::vector<mem_event_t> mem_events;
+
+    if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
+        direct_reclaim_start_tm.tv_sec = 0;
+        direct_reclaim_start_tm.tv_nsec = 0;
+        ALOGE("Failed to get current time for direct reclaim state change.");
+        return;
+    }
+
+    if (!memevent_listener->getMemEvents(mem_events)) {
+        direct_reclaim_start_tm.tv_sec = 0;
+        direct_reclaim_start_tm.tv_nsec = 0;
+        ALOGE("Failed fetching direct reclaim events.");
+        return;
+    }
+
+    /*
+     * `mem_events` is ordered from oldest to newest, therefore we use
+     * the last/latest direct reclaim event as the current direct reclaim
+     * state.
+     */
+    for (const mem_event_t mem_event : mem_events) {
+        if (mem_event.type == MEM_EVENT_DIRECT_RECLAIM_BEGIN) {
+            direct_reclaim_start_tm = curr_tm;
+        } else if (mem_event.type == MEM_EVENT_DIRECT_RECLAIM_END) {
+            direct_reclaim_start_tm.tv_sec = 0;
+            direct_reclaim_start_tm.tv_nsec = 0;
+        }
+    }
+}
+
+static bool init_direct_reclaim_monitoring() {
+    static struct event_handler_info direct_reclaim_poll_hinfo = {0, direct_reclaim_state_change};
+
+    if (!memevent_listener) {
+        // Make sure bpf programs are loaded
+        android::bpf::waitForProgsLoaded();
+        memevent_listener = std::make_unique<android::bpf::memevents::MemEventListener>(
+                android::bpf::memevents::MemEventClient::LMKD);
+    }
+
+    if (!memevent_listener->ok()) {
+        ALOGE("Failed to initialize memevents listener");
+        memevent_listener.reset();
+        return false;
+    }
+
+    if (!memevent_listener->registerEvent(MEM_EVENT_DIRECT_RECLAIM_BEGIN) ||
+        !memevent_listener->registerEvent(MEM_EVENT_DIRECT_RECLAIM_END)) {
+        ALOGE("Failed to register direct reclaim memevents");
+        memevent_listener.reset();
+        return false;
+    }
+
+    int memevent_listener_fd = memevent_listener->getRingBufferFd();
+    if (memevent_listener_fd < 0) {
+        memevent_listener.reset();
+        ALOGE("Invalid memevent_listener fd: %d", memevent_listener_fd);
+        return false;
+    }
+
+    struct epoll_event epev;
+    epev.events = EPOLLIN;
+    epev.data.ptr = (void*)&direct_reclaim_poll_hinfo;
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, memevent_listener_fd, &epev) < 0) {
+        ALOGE("Failed registering direct reclaim fd: %d; errno=%d", memevent_listener_fd, errno);
+        /*
+         * Reset the fd to let `destroy_direct_reclaim_monitoring` know we failed adding this fd,
+         * therefore it won't try to close the `memevent_listener_fd`.
+         */
+        memevent_listener.reset();
+        return false;
+    }
+
+    direct_reclaim_start_tm.tv_sec = 0;
+    direct_reclaim_start_tm.tv_nsec = 0;
+
+    maxevents++;
+    return true;
+}
+
+static void destroy_direct_reclaim_monitoring() {
+    if (!memevent_listener) return;
+
+    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, memevent_listener->getRingBufferFd(), NULL) < 0) {
+        ALOGE("Failed to unregister direct reclaim monitoring; errno=%d", errno);
+    }
+
+    maxevents--;
+    memevent_listener.reset();
+    direct_reclaim_start_tm.tv_sec = 0;
+    direct_reclaim_start_tm.tv_nsec = 0;
+}
+
 static bool init_psi_monitors() {
     /*
      * When PSI is used on low-ram devices or on high-end devices without memfree levels
@@ -4534,6 +4646,13 @@ static bool init_monitors() {
     } else {
         ALOGI("Using vmpressure for memory pressure detection");
     }
+
+    if (init_direct_reclaim_monitoring()) {
+        ALOGI("Using memevents for direct reclaim detection");
+    } else {
+        ALOGI("Using vmstats for direct reclaim detection");
+    }
+
     monitors_initialized = true;
     return true;
 }
@@ -4549,6 +4668,7 @@ static void destroy_monitors() {
         destroy_mp_common(VMPRESS_LEVEL_MEDIUM);
         destroy_mp_common(VMPRESS_LEVEL_LOW);
     }
+    destroy_direct_reclaim_monitoring();
 }
 
 static void update_psi_window_size() {

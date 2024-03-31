@@ -19,19 +19,19 @@ lmkd_hooks_cc_defaults {
     soong_config_variables: {
         use_hooks: {
             cflags: [
-                "-DLMKD_USE_HOOKS"
+                "-DLMKD_USE_HOOKS",
             ],
             static_libs: [
-                "liblmkdhooks"
-            ]
-        }
-    }
+                "liblmkdhooks",
+            ],
+        },
+    },
 }
 
 cc_defaults {
     name: "stats_defaults",
     cflags: [
-        "-DLMKD_LOG_STATS"
+        "-DLMKD_LOG_STATS",
     ],
 }
 
@@ -44,8 +44,10 @@ cc_binary {
         "watchdog.cpp",
     ],
     shared_libs: [
+        "libbase",
         "libcutils",
         "liblog",
+        "libmemevents",
         "libprocessgroup",
         "libpsi",
     ],
@@ -54,17 +56,20 @@ cc_binary {
         "liblmkd_utils",
     ],
     header_libs: [
-        "bpf_syscall_wrappers",
+        "bpf_headers",
     ],
     local_include_dirs: ["include"],
     cflags: [
         "-Wall",
         "-Werror",
         "-Wextra",
-        "-DLMKD_TRACE_KILLS"
+        "-DLMKD_TRACE_KILLS",
     ],
     init_rc: ["lmkd.rc"],
-    defaults: ["stats_defaults", "lmkd_hooks_defaults"],
+    defaults: [
+        "stats_defaults",
+        "lmkd_hooks_defaults",
+    ],
     logtags: ["event.logtags"],
     afdo: true,
 }
@@ -98,5 +103,5 @@ cc_library_static {
         "-g",
         "-Wall",
         "-Werror",
-    ]
+    ],
 }
