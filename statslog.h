@@ -69,6 +69,7 @@ enum kill_reasons {
     COMPACTION,
     DIRECT_RECL_AND_THROT,
     DIRECT_RECL_AND_LOW_MEM,
+    DIRECT_RECL_STUCK,
     KILL_REASON_COUNT
 };
 

@@ -37,6 +37,7 @@ enum lmk_cmd {
     LMK_UPDATE_PROPS,       /* Reinit properties */
     LMK_STAT_KILL_OCCURRED, /* Unsolicited msg to subscribed clients on proc kills for statsd log */
     LMK_START_MONITORING,   /* Start psi monitoring if it was skipped earlier */
+    LMK_BOOT_COMPLETED,     /* Notify LMKD boot is completed */
 };
 
 /*
@@ -286,7 +287,7 @@ static inline size_t lmkd_pack_set_update_props_repl(LMKD_CTRL_PACKET packet, in
     return 2 * sizeof(int);
 }
 
-/* LMK_PROCPRIO reply payload */
+/* LMK_UPDATE_PROPS reply payload */
 struct lmk_update_props_reply {
     int result;
 };
@@ -297,6 +298,39 @@ struct lmk_update_props_reply {
  */
 static inline void lmkd_pack_get_update_props_repl(LMKD_CTRL_PACKET packet,
                                           struct lmk_update_props_reply* params) {
+    params->result = ntohl(packet[1]);
+}
+
+/*
+ * Prepare LMK_BOOT_COMPLETED packet and return packet size in bytes.
+ * Warning: no checks performed, caller should ensure valid parameters.
+ */
+static inline size_t lmkd_pack_set_boot_completed_notif(LMKD_CTRL_PACKET packet) {
+    packet[0] = htonl(LMK_BOOT_COMPLETED);
+    return sizeof(int);
+}
+
+/*
+ * Prepare LMK_BOOT_COMPLETED reply packet and return packet size in bytes.
+ * Warning: no checks performed, caller should ensure valid parameters.
+ */
+static inline size_t lmkd_pack_set_boot_completed_notif_repl(LMKD_CTRL_PACKET packet, int result) {
+    packet[0] = htonl(LMK_BOOT_COMPLETED);
+    packet[1] = htonl(result);
+    return 2 * sizeof(int);
+}
+
+/* LMK_BOOT_COMPLETED reply payload */
+struct lmk_boot_completed_notif_reply {
+    int result;
+};
+
+/*
+ * For LMK_BOOT_COMPLETED reply payload.
+ * Warning: no checks performed, caller should ensure valid parameters.
+ */
+static inline void lmkd_pack_get_boot_completed_notif_repl(
+        LMKD_CTRL_PACKET packet, struct lmk_boot_completed_notif_reply* params) {
     params->result = ntohl(packet[1]);
 }
 

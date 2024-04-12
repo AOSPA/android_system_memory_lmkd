@@ -44,7 +44,6 @@
 #include <shared_mutex>
 #include <vector>
 
-#include <bpf/KernelUtils.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
@@ -175,7 +174,11 @@ static inline void trace_kill_end() {}
 #define DEF_PARTIAL_STALL_LOWRAM 200
 #define DEF_PARTIAL_STALL 70
 /* ro.lmk.psi_complete_stall_ms property defaults */
-#define DEF_COMPLETE_STALL 70
+#define DEF_COMPLETE_STALL 700
+/* ro.lmk.direct_reclaim_threshold_ms property defaults */
+#define DEF_DIRECT_RECL_THRESH_MS 0
+/* ro.lmk.swap_compression_ratio property defaults */
+#define DEF_SWAP_COMP_RATIO 1
 
 #define PSI_CONT_EVENT_THRESH (4)
 #define LMKD_REINIT_PROP "lmkd.reinit"
@@ -217,9 +220,10 @@ struct psi_threshold {
     int threshold_ms;
 };
 
-/* Listener for direct reclaim state changes */
+/* Listener for direct reclaim and kswapd state changes */
 static std::unique_ptr<android::bpf::memevents::MemEventListener> memevent_listener(nullptr);
 static struct timespec direct_reclaim_start_tm;
+static struct timespec kswapd_start_tm;
 
 static int level_oomadj[VMPRESS_LEVEL_COUNT];
 static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1, -1 };
@@ -227,6 +231,7 @@ static bool pidfd_supported;
 static int last_kill_pid_or_fd = -1;
 static struct timespec last_kill_tm;
 static bool monitors_initialized;
+static bool boot_completed_handled = false;
 
 /* lmkd configurable parameters */
 static bool is_userdebug_or_eng_build;
@@ -269,6 +274,8 @@ static bool use_perf_api_for_pref_apps;
 static int psi_window_size_ms = PSI_WINDOW_SIZE_MS;
 static int psi_poll_period_scrit_ms = PSI_POLL_PERIOD_SHORT_MS;
 static bool delay_monitors_until_boot;
+static int direct_reclaim_threshold_ms;
+static int swap_compression_ratio;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
     { PSI_SOME, PSI_OLD_LOW_THRESH_MS },    /* Default 70ms out of 1sec for partial stall */
     { PSI_SOME, PSI_OLD_MED_THRESH_MS },   /* Default 100ms out of 1sec for partial stall */
@@ -333,7 +340,7 @@ static struct event_handler_info vmpressure_hinfo[VMPRESS_LEVEL_COUNT];
 /*
  * 1 ctrl listen socket, 3 ctrl data socket, 3 memory pressure levels,
  * 1 lmk events + 1 fd to wait for process death + 1 fd to receive kill failure notifications
- * + 1 fd to receive direct reclaim state change notifications
+ * + 1 fd to receive memevent_listener notifications
  */
 #define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1 + 1)
 static int epollfd;
@@ -689,6 +696,7 @@ static void * handle_perfd = NULL;
 static bool update_props();
 static bool init_monitors();
 static void destroy_monitors();
+static bool init_memevent_listener_monitoring();
 
 static int clamp(int low, int high, int value) {
     return std::max(std::min(value, high), low);
@@ -1740,6 +1748,11 @@ static void ctrl_command_handler(int dsock_idx) {
             } else {
                 result = 0;
             }
+
+            if (direct_reclaim_threshold_ms > 0 && !memevent_listener) {
+                ALOGW("Kernel support for direct_reclaim_threshold_ms is not found");
+                direct_reclaim_threshold_ms = 0;
+            }
         }
 
         len = lmkd_pack_set_update_props_repl(packet, result);
@@ -1771,6 +1784,38 @@ static void ctrl_command_handler(int dsock_idx) {
             exit(1);
         }
         ALOGI("Initialized monitors after boot completed.");
+        break;
+    case LMK_BOOT_COMPLETED:
+        if (nargs != 0) goto wronglen;
+
+        if (boot_completed_handled) {
+            /* Notify we have already handled post boot-up operations */
+            result = 1;
+        } else if (!property_get_bool("sys.boot_completed", false)) {
+            ALOGE("LMK_BOOT_COMPLETED cannot be handled before boot completed");
+            result = -1;
+        } else {
+            /*
+             * Initialize the memevent listener after boot is completed to prevent
+             * waiting, during boot-up, for BPF programs to be loaded.
+             */
+            if (init_memevent_listener_monitoring()) {
+                ALOGI("Using memevents for direct reclaim and kswapd detection");
+            } else {
+                ALOGI("Using vmstats for direct reclaim and kswapd detection");
+                if (direct_reclaim_threshold_ms > 0) {
+                    ALOGW("Kernel support for direct_reclaim_threshold_ms is not found");
+                    direct_reclaim_threshold_ms = 0;
+                }
+            }
+            result = 0;
+            boot_completed_handled = true;
+        }
+
+        len = lmkd_pack_set_boot_completed_notif_repl(packet, result);
+        if (ctrl_data_write(dsock_idx, (char*)packet, len) != len) {
+            ALOGE("Failed to report boot-completed operation results");
+        }
         break;
     default:
         ALOGE("Received unknown command code %d", cmd);
@@ -2122,8 +2167,12 @@ static int meminfo_parse(union meminfo *mi) {
 // from the free memory or reclaimed. Use the lowest of free_swap and easily available memory to
 // measure free swap because they represent how much swap space the system will consider to use
 // and how much it can actually use.
+// Swap compression ratio in the calculation can be adjusted using swap_compression_ratio tunable.
+// By setting swap_compression_ratio to 0, available memory can be ignored.
 static inline int64_t get_free_swap(union meminfo *mi) {
-    return std::min(mi->field.free_swap, mi->field.easy_available);
+    if (swap_compression_ratio)
+        return std::min(mi->field.free_swap, mi->field.easy_available * swap_compression_ratio);
+    return mi->field.free_swap;
 }
 
 /* /proc/vmstat parsing routines */
@@ -3511,6 +3560,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
            wbf_effective = wmark_boost_factor;
     }
     bool in_direct_reclaim;
+    long direct_reclaim_duration_ms;
+    bool in_kswapd_reclaim;
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
@@ -3610,9 +3661,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         in_compaction = true;
     }
 
-    in_direct_reclaim = memevent_listener ? (direct_reclaim_start_tm.tv_sec != 0 ||
-                                             direct_reclaim_start_tm.tv_nsec != 0)
-                                          : (vs.field.pgscan_direct != init_pgscan_direct);
+    if (memevent_listener) {
+        in_direct_reclaim =
+                direct_reclaim_start_tm.tv_sec != 0 || direct_reclaim_start_tm.tv_nsec != 0;
+        in_kswapd_reclaim = kswapd_start_tm.tv_sec != 0 || kswapd_start_tm.tv_nsec != 0;
+    } else {
+        in_direct_reclaim = vs.field.pgscan_direct != init_pgscan_direct;
+        in_kswapd_reclaim = (vs.field.pgscan_kswapd != init_pgscan_kswapd) ||
+                            (vs.field.pgrefill != init_pgrefill);
+    }
 
     /* Identify reclaim state */
     if (in_direct_reclaim) {
@@ -3622,11 +3679,12 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
+        direct_reclaim_duration_ms = get_time_diff_ms(&direct_reclaim_start_tm, &curr_tm);
         reclaim = DIRECT_RECLAIM;
-    }  else if (vs.field.pgscan_direct_throttle > init_direct_throttle) {
+    } else if (vs.field.pgscan_direct_throttle > init_direct_throttle) {
         init_direct_throttle = vs.field.pgscan_direct_throttle;
         reclaim = DIRECT_RECLAIM_THROTTLE;
-    } else if (vs.field.pgscan_kswapd != init_pgscan_kswapd) {
+    } else if (in_kswapd_reclaim) {
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
         init_pgrefill = vs.field.pgrefill;
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
@@ -3638,6 +3696,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
+    } else if (workingset_refault_file == prev_workingset_refault) {
         /*
          * On a system with only 2 zones, pgrefill indicating that pages are not eligible.
          * Then there may be real refilling happens for normal zone pages too.
@@ -3726,6 +3785,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         max_thrashing = thrashing;
     }
 
+update_watermarks:
     if (zoneinfo_parse(&zi) < 0) {
         ALOGE("Failed to parse zoneinfo!");
         return;
@@ -3838,6 +3898,12 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
 
         check_filecache = true;
+    } else if (reclaim == DIRECT_RECLAIM && direct_reclaim_threshold_ms > 0 &&
+               direct_reclaim_duration_ms > direct_reclaim_threshold_ms) {
+        kill_reason = DIRECT_RECL_STUCK;
+        snprintf(kill_desc, sizeof(kill_desc),
+                 "device is stuck in direct reclaim (%" PRId64 "ms > %dms)",
+                 direct_reclaim_duration_ms, direct_reclaim_threshold_ms);
     } else if (check_filecache) {
         int64_t file_lru_kb = (vs.field.nr_inactive_file + vs.field.nr_active_file) * page_k;
 
@@ -3878,6 +3944,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             .thrashing = (int)thrashing,
             .max_thrashing = max_thrashing,
         };
+        static bool first_kill = true;
+
+        /* Make sure watermarks are correct before the first kill */
+        if (first_kill) {
+            first_kill = false;
+            // watermarks.high_wmark = 0;  // force recomputation
+            goto update_watermarks;
+        }
 
         /* Allow killing perceptible apps if the system is stalled */
         if (critical_stall) {
@@ -4385,49 +4459,58 @@ static MemcgVersion memcg_version() {
     return version;
 }
 
-static void direct_reclaim_state_change(int data __unused, uint32_t events __unused,
-                                        struct polling_params* poll_params __unused) {
+static void memevent_listener_notification(int data __unused, uint32_t events __unused,
+                                           struct polling_params* poll_params __unused) {
     struct timespec curr_tm;
     std::vector<mem_event_t> mem_events;
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         direct_reclaim_start_tm.tv_sec = 0;
         direct_reclaim_start_tm.tv_nsec = 0;
-        ALOGE("Failed to get current time for direct reclaim state change.");
+        ALOGE("Failed to get current time for memevent listener notification.");
         return;
     }
 
     if (!memevent_listener->getMemEvents(mem_events)) {
         direct_reclaim_start_tm.tv_sec = 0;
         direct_reclaim_start_tm.tv_nsec = 0;
-        ALOGE("Failed fetching direct reclaim events.");
+        ALOGE("Failed fetching memory listener events.");
         return;
     }
 
-    /*
-     * `mem_events` is ordered from oldest to newest, therefore we use
-     * the last/latest direct reclaim event as the current direct reclaim
-     * state.
-     */
-    for (const mem_event_t mem_event : mem_events) {
-        if (mem_event.type == MEM_EVENT_DIRECT_RECLAIM_BEGIN) {
-            direct_reclaim_start_tm = curr_tm;
-        } else if (mem_event.type == MEM_EVENT_DIRECT_RECLAIM_END) {
-            direct_reclaim_start_tm.tv_sec = 0;
-            direct_reclaim_start_tm.tv_nsec = 0;
+    for (const mem_event_t& mem_event : mem_events) {
+        switch (mem_event.type) {
+            /* Direct Reclaim */
+            case MEM_EVENT_DIRECT_RECLAIM_BEGIN:
+                direct_reclaim_start_tm = curr_tm;
+                break;
+            case MEM_EVENT_DIRECT_RECLAIM_END:
+                direct_reclaim_start_tm.tv_sec = 0;
+                direct_reclaim_start_tm.tv_nsec = 0;
+                break;
+
+            /* kswapd */
+            case MEM_EVENT_KSWAPD_WAKE:
+                kswapd_start_tm = curr_tm;
+                break;
+            case MEM_EVENT_KSWAPD_SLEEP:
+                kswapd_start_tm.tv_sec = 0;
+                kswapd_start_tm.tv_nsec = 0;
+                break;
         }
     }
 }
 
-static bool init_direct_reclaim_monitoring() {
-    static struct event_handler_info direct_reclaim_poll_hinfo = {0, direct_reclaim_state_change};
+static bool init_memevent_listener_monitoring() {
+    static struct event_handler_info direct_reclaim_poll_hinfo = {0,
+                                                                  memevent_listener_notification};
 
-    if (!memevent_listener) {
-        // Make sure bpf programs are loaded
-        android::bpf::waitForProgsLoaded();
-        memevent_listener = std::make_unique<android::bpf::memevents::MemEventListener>(
-                android::bpf::memevents::MemEventClient::LMKD);
-    }
+    if (memevent_listener) return true;
+
+    // Make sure bpf programs are loaded, else we'll wait until they are loaded
+    android::bpf::waitForProgsLoaded();
+    memevent_listener = std::make_unique<android::bpf::memevents::MemEventListener>(
+            android::bpf::memevents::MemEventClient::LMKD);
 
     if (!memevent_listener->ok()) {
         ALOGE("Failed to initialize memevents listener");
@@ -4438,6 +4521,12 @@ static bool init_direct_reclaim_monitoring() {
     if (!memevent_listener->registerEvent(MEM_EVENT_DIRECT_RECLAIM_BEGIN) ||
         !memevent_listener->registerEvent(MEM_EVENT_DIRECT_RECLAIM_END)) {
         ALOGE("Failed to register direct reclaim memevents");
+        memevent_listener.reset();
+        return false;
+    }
+    if (!memevent_listener->registerEvent(MEM_EVENT_KSWAPD_WAKE) ||
+        !memevent_listener->registerEvent(MEM_EVENT_KSWAPD_SLEEP)) {
+        ALOGE("Failed to register kswapd memevents");
         memevent_listener.reset();
         return false;
     }
@@ -4453,11 +4542,7 @@ static bool init_direct_reclaim_monitoring() {
     epev.events = EPOLLIN;
     epev.data.ptr = (void*)&direct_reclaim_poll_hinfo;
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, memevent_listener_fd, &epev) < 0) {
-        ALOGE("Failed registering direct reclaim fd: %d; errno=%d", memevent_listener_fd, errno);
-        /*
-         * Reset the fd to let `destroy_direct_reclaim_monitoring` know we failed adding this fd,
-         * therefore it won't try to close the `memevent_listener_fd`.
-         */
+        ALOGE("Failed registering memevent_listener fd: %d; errno=%d", memevent_listener_fd, errno);
         memevent_listener.reset();
         return false;
     }
@@ -4467,19 +4552,6 @@ static bool init_direct_reclaim_monitoring() {
 
     maxevents++;
     return true;
-}
-
-static void destroy_direct_reclaim_monitoring() {
-    if (!memevent_listener) return;
-
-    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, memevent_listener->getRingBufferFd(), NULL) < 0) {
-        ALOGE("Failed to unregister direct reclaim monitoring; errno=%d", errno);
-    }
-
-    maxevents--;
-    memevent_listener.reset();
-    direct_reclaim_start_tm.tv_sec = 0;
-    direct_reclaim_start_tm.tv_nsec = 0;
 }
 
 static bool init_psi_monitors() {
@@ -4647,12 +4719,6 @@ static bool init_monitors() {
         ALOGI("Using vmpressure for memory pressure detection");
     }
 
-    if (init_direct_reclaim_monitoring()) {
-        ALOGI("Using memevents for direct reclaim detection");
-    } else {
-        ALOGI("Using vmstats for direct reclaim detection");
-    }
-
     monitors_initialized = true;
     return true;
 }
@@ -4668,7 +4734,6 @@ static void destroy_monitors() {
         destroy_mp_common(VMPRESS_LEVEL_MEDIUM);
         destroy_mp_common(VMPRESS_LEVEL_LOW);
     }
-    destroy_direct_reclaim_monitoring();
 }
 
 static void update_psi_window_size() {
@@ -5153,6 +5218,41 @@ int issue_reinit() {
     return res == UPDATE_PROPS_SUCCESS ? 0 : -1;
 }
 
+static int on_boot_completed() {
+    int sock;
+
+    sock = lmkd_connect();
+    if (sock < 0) {
+        ALOGE("failed to connect to lmkd: %s", strerror(errno));
+        return -1;
+    }
+
+    enum boot_completed_notification_result res = lmkd_notify_boot_completed(sock);
+
+    switch (res) {
+        case BOOT_COMPLETED_NOTIF_SUCCESS:
+            break;
+        case BOOT_COMPLETED_NOTIF_ALREADY_HANDLED:
+            ALOGW("lmkd already handled boot-completed operations");
+            break;
+        case BOOT_COMPLETED_NOTIF_SEND_ERR:
+            ALOGE("failed to send lmkd request: %m");
+            break;
+        case BOOT_COMPLETED_NOTIF_RECV_ERR:
+            ALOGE("failed to receive request: %m");
+            break;
+        case BOOT_COMPLETED_NOTIF_FORMAT_ERR:
+            ALOGE("lmkd reply is invalid");
+            break;
+        case BOOT_COMPLETED_NOTIF_FAILS:
+            ALOGE("lmkd failed to receive boot-completed notification");
+            break;
+    }
+
+    close(sock);
+    return res == BOOT_COMPLETED_NOTIF_SUCCESS ? 0 : -1;
+}
+
 static void create_handle_for_perf_iop() {
     handle_perfd = dlopen(PERFD_LIB, RTLD_NOW);
     handle_iopd = dlopen(IOPD_LIB, RTLD_NOW);
@@ -5446,6 +5546,10 @@ static bool update_props() {
     filecache_min_kb = GET_LMK_PROPERTY(int64, "filecache_min_kb", 0);
     stall_limit_critical = GET_LMK_PROPERTY(int64, "stall_limit_critical", 100);
     delay_monitors_until_boot = GET_LMK_PROPERTY(bool, "delay_monitors_until_boot", false);
+    direct_reclaim_threshold_ms =
+            GET_LMK_PROPERTY(int64, "direct_reclaim_threshold_ms", DEF_DIRECT_RECL_THRESH_MS);
+    swap_compression_ratio =
+            GET_LMK_PROPERTY(int64, "swap_compression_ratio", DEF_SWAP_COMP_RATIO);
 
     reaper.enable_debug(debug_process_killing);
 
@@ -5461,11 +5565,15 @@ static bool update_props() {
 }
 
 int main(int argc, char **argv) {
-    if ((argc > 1) && argv[1] && !strcmp(argv[1], "--reinit")) {
-        if (property_set(LMKD_REINIT_PROP, "")) {
-            ALOGE("Failed to reset " LMKD_REINIT_PROP " property");
+    if ((argc > 1) && argv[1]) {
+        if (!strcmp(argv[1], "--reinit")) {
+            if (property_set(LMKD_REINIT_PROP, "")) {
+                ALOGE("Failed to reset " LMKD_REINIT_PROP " property");
+            }
+            return issue_reinit();
+        } else if (!strcmp(argv[1], "--boot_completed")) {
+            return on_boot_completed();
         }
-        return issue_reinit();
     }
 
     if (!update_props()) {

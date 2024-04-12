@@ -78,6 +78,46 @@ enum update_props_result lmkd_update_props(int sock) {
     return params.result == 0 ? UPDATE_PROPS_SUCCESS : UPDATE_PROPS_FAIL;
 }
 
+enum boot_completed_notification_result lmkd_notify_boot_completed(int sock) {
+    LMKD_CTRL_PACKET packet;
+    int size;
+
+    size = lmkd_pack_set_boot_completed_notif(packet);
+    if (TEMP_FAILURE_RETRY(write(sock, packet, size)) < 0) {
+        return BOOT_COMPLETED_NOTIF_SEND_ERR;
+    }
+
+    size = TEMP_FAILURE_RETRY(read(sock, packet, CTRL_PACKET_MAX_SIZE));
+    if (size < 0) {
+        return BOOT_COMPLETED_NOTIF_RECV_ERR;
+    }
+
+    if (size != 2 * sizeof(int) || lmkd_pack_get_cmd(packet) != LMK_BOOT_COMPLETED) {
+        return BOOT_COMPLETED_NOTIF_FORMAT_ERR;
+    }
+
+    struct lmk_boot_completed_notif_reply params;
+    lmkd_pack_get_boot_completed_notif_repl(packet, &params);
+
+    enum boot_completed_notification_result res;
+    switch (params.result) {
+        case -1:
+            res = BOOT_COMPLETED_NOTIF_FAILS;
+            break;
+        case 0:
+            res = BOOT_COMPLETED_NOTIF_SUCCESS;
+            break;
+        case 1:
+            res = BOOT_COMPLETED_NOTIF_ALREADY_HANDLED;
+            break;
+        default:
+            /* This should never be reached */
+            res = BOOT_COMPLETED_NOTIF_FAILS;
+    }
+
+    return res;
+}
+
 int create_memcg(uid_t uid, pid_t pid) {
     return createProcessGroup(uid, pid, true) == 0 ? 0 : -1;
 }

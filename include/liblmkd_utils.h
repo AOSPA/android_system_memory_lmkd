@@ -71,6 +71,20 @@ enum update_props_result lmkd_update_props(int sock);
  */
 int create_memcg(uid_t uid, pid_t pid);
 
+enum boot_completed_notification_result {
+    BOOT_COMPLETED_NOTIF_SUCCESS,
+    BOOT_COMPLETED_NOTIF_FAILS,
+    BOOT_COMPLETED_NOTIF_ALREADY_HANDLED,
+    BOOT_COMPLETED_NOTIF_SEND_ERR,
+    BOOT_COMPLETED_NOTIF_RECV_ERR,
+    BOOT_COMPLETED_NOTIF_FORMAT_ERR,
+};
+
+/*
+ * Notify LMKD the device has finished booting up.
+ */
+enum boot_completed_notification_result lmkd_notify_boot_completed(int sock);
+
 __END_DECLS
 
 #endif /* _LIBLMKD_UTILS_H_ */
