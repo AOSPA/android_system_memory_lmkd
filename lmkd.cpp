@@ -955,6 +955,52 @@ static void stats_write_lmk_kill_occurred_pid(int pid, struct kill_stat *kill_st
     }
 }
 
+/*
+ * Log how many apps were killed since lmkd's execution in
+ * module_param_array() fashion to sys.lmk.count.
+ *
+ * lmkd's uptime is additionally logged in sys.lmkd.boottime.
+ *
+ * Example: echo Uptime $(($(date +%s) - $(getprop sys.lmk.boottime))): $(getprop sys.lmk.count)
+ */
+#define ADJ_MAX 1000
+#define ADJ_DIVISOR 50
+#define PROP_REPORT_FREQ 10
+static void prop_log_lmk_kill_occurred(struct kill_stat *kill_st) {
+    static unsigned int lmk_count[(ADJ_MAX / ADJ_DIVISOR) + 1];
+    static char lmk_count_str[PROPERTY_VALUE_MAX];
+    static int counter;
+    int adj_index;
+    unsigned long i;
+    char *ptr = &lmk_count_str[0];
+
+    adj_index = kill_st->oom_score / ADJ_DIVISOR;
+    if (adj_index > (ADJ_MAX / ADJ_DIVISOR))
+        adj_index = (ADJ_MAX / ADJ_DIVISOR);
+    lmk_count[adj_index]++;
+
+    if (++counter != PROP_REPORT_FREQ)
+        return;
+
+    counter = 0;
+
+    for (i = 0; i < sizeof(lmk_count) / sizeof(typeof(lmk_count[0])); i++)
+        ptr += sprintf(ptr, "%d,", lmk_count[i]);
+    *(ptr - 1) = '\0';
+
+    ALOGI("lmk_count[]: %s", lmk_count_str);
+    property_set("sys.lmk.count", lmk_count_str);
+}
+
+static void prop_log_init(void) {
+    struct timespec curr_tm;
+    char prop[PROPERTY_VALUE_MAX];
+
+    clock_gettime(CLOCK_REALTIME, &curr_tm);
+    sprintf(prop, "%ld", curr_tm.tv_sec);
+    property_set("sys.lmk.boottime", prop);
+}
+
 static void poll_kernel(int poll_fd) {
     if (poll_fd == -1) {
         // not waiting
@@ -3215,6 +3261,8 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
 
     ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid, rss_kb);
 
+    prop_log_lmk_kill_occurred(&kill_st);
+
     result = rss_kb / page_k;
 
 out:
@@ -5323,6 +5371,8 @@ int main(int argc, char **argv) {
         if (!watchdog.init()) {
             ALOGE("Failed to initialize the watchdog");
         }
+
+        prop_log_init();
 
         mainloop();
     }
