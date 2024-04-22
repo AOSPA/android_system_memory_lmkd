@@ -53,11 +53,6 @@ enum lmk_cmd {
 #define CTRL_PACKET_MAX_SIZE (sizeof(int) * (MAX_TARGETS * 2 + 1))
 
 /*
- * Max number of characters in line.
- */
-#define LINE_MAX 128
-
-/*
  * Max size of work buffer
  */
 #define BUF_MAX 4096
