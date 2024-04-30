@@ -3219,8 +3219,15 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
             if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
-                zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
-                zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
+
+                /* When MGLRU is enabled, pgskip values are not reliable.
+                 * So, consider the file caches only from the zones with
+                 * watermark breached.
+                 */
+                if (MGLRU_status == 0 || zone->fields.field.nr_free_pages < zone->fields.field.low){
+                    zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
+                    zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
+                }
 
                 max_high = std::max(max_high, zone->fields.field.high);
                 max_low = std::max(max_low, zone->fields.field.low);
