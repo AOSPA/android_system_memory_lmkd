@@ -3113,11 +3113,11 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
         zm_breached = WMARK_MIN;
         breached_wm_level = watermarks->min_wmark;
     }
-    if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->low_wmark) {
+    else if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->low_wmark) {
         zm_breached = WMARK_LOW;
         breached_wm_level = wbf_effective * watermarks->low_wmark;
     }
-    if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->high_wmark) {
+    else if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->high_wmark) {
         zm_breached = WMARK_HIGH;
         breached_wm_level = wbf_effective * watermarks->high_wmark;
     }
@@ -3224,7 +3224,7 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
                  * So, consider the file caches only from the zones with
                  * watermark breached.
                  */
-                if (MGLRU_status == 0 || zone->fields.field.nr_free_pages < zone->fields.field.low){
+                if (MGLRU_status == 0 || zone->fields.field.nr_free_pages <= zone->fields.field.high * wbf_effective){
                     zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
                     zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
                 }
