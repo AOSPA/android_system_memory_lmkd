@@ -104,8 +104,9 @@ properties:
                                  to kill when memory is critically low. Setting it
                                  to 1001 will prevent any kills for this reason. Min
                                  acceptable value is 201 (apps up to perceptible).
-                                 Default = 701 (all cached apps excluding the last
-                                 active one).
+                                 Default for low-RAM devices = 1001 (disabled), for
+                                 high-end devices = 701 (all cached apps excluding
+                                 the last active one).
 
 lmkd will set the following Android properties according to current system
 configurations:
