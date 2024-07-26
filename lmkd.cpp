@@ -1151,7 +1151,7 @@ static bool read_proc_status(int pid, char *buf, size_t buf_sz) {
 
     size = read_all(fd, buf, buf_sz - 1);
     close(fd);
-    if (size < 0) {
+    if (size <= 0) {
         return false;
     }
     buf[size] = 0;
@@ -1296,7 +1296,7 @@ static char *proc_get_name(int pid, char *buf, size_t buf_size) {
     }
     ret = read_all(fd, buf, buf_size - 1);
     close(fd);
-    if (ret < 0) {
+    if (ret <= 0) {
         return NULL;
     }
     buf[ret] = '\0';
