@@ -44,6 +44,8 @@
 #include <shared_mutex>
 #include <vector>
 
+#include <BpfSyscallWrappers.h>
+#include <android-base/unique_fd.h>
 #include <bpf/KernelUtils.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <cutils/properties.h>
@@ -64,9 +66,6 @@
 #include "reaper.h"
 #include "statslog.h"
 #include "watchdog.h"
-
-#define BPF_FD_JUST_USE_INT
-#include "BpfSyscallWrappers.h"
 
 /*
  * Define LMKD_TRACE_KILLS to record lmkd kills in kernel traces
@@ -182,7 +181,6 @@ static inline void trace_kill_end() {}
 /* ro.lmk.swap_compression_ratio property defaults */
 #define DEF_SWAP_COMP_RATIO 1
 /* ro.lmk.lowmem_min_oom_score defaults */
-#define DEF_LOWMEM_MIN_SCORE_LOWRAM (OOM_SCORE_ADJ_MAX + 1)
 #define DEF_LOWMEM_MIN_SCORE (PREVIOUS_APP_ADJ + 1)
 
 #define PSI_CONT_EVENT_THRESH (4)
@@ -1152,7 +1150,7 @@ static bool read_proc_status(int pid, char *buf, size_t buf_sz) {
 
     size = read_all(fd, buf, buf_sz - 1);
     close(fd);
-    if (size < 0) {
+    if (size <= 0) {
         return false;
     }
     buf[size] = 0;
@@ -1297,7 +1295,7 @@ static char *proc_get_name(int pid, char *buf, size_t buf_size) {
     }
     ret = read_all(fd, buf, buf_size - 1);
     close(fd);
-    if (ret < 0) {
+    if (ret <= 0) {
         return NULL;
     }
     buf[ret] = '\0';
@@ -2308,12 +2306,12 @@ static bool meminfo_parse_line(char *line, union meminfo *mi) {
 }
 
 static int64_t read_gpu_total_kb() {
-    static int fd = android::bpf::bpfFdGet(
-            "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map", BPF_F_RDONLY);
+    static android::base::unique_fd fd(
+            android::bpf::mapRetrieveRO("/sys/fs/bpf/map_gpuMem_gpu_mem_total_map"));
     static constexpr uint64_t kBpfKeyGpuTotalUsage = 0;
     uint64_t value;
 
-    if (fd < 0) {
+    if (!fd.ok()) {
         return 0;
     }
 
@@ -5040,10 +5038,9 @@ static bool update_props() {
             GET_LMK_PROPERTY(int64, "direct_reclaim_threshold_ms", DEF_DIRECT_RECL_THRESH_MS);
     swap_compression_ratio =
             GET_LMK_PROPERTY(int64, "swap_compression_ratio", DEF_SWAP_COMP_RATIO);
-    lowmem_min_oom_score = std::max(
-            PERCEPTIBLE_APP_ADJ + 1,
-            GET_LMK_PROPERTY(int32, "lowmem_min_oom_score",
-                             low_ram_device ? DEF_LOWMEM_MIN_SCORE_LOWRAM : DEF_LOWMEM_MIN_SCORE));
+    lowmem_min_oom_score =
+            std::max(PERCEPTIBLE_APP_ADJ + 1,
+                     GET_LMK_PROPERTY(int32, "lowmem_min_oom_score", DEF_LOWMEM_MIN_SCORE));
 
     reaper.enable_debug(debug_process_killing);
 
