@@ -1673,7 +1673,6 @@ static void handle_io_uring_procs_prio(const struct lmk_procs_prio& params, cons
     char buffers[PROCS_PRIO_MAX_RECORD_COUNT]
                 [256]; /* Reading proc/stat and write to proc/oom_score_adj */
     char path[PROCFS_PATH_MAX];
-    char val[20];
     int64_t tgid;
     int ret;
     int num_requests = 0;
