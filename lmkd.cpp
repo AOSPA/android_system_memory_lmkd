@@ -3531,7 +3531,6 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
-        PGREFILL,
         DIRECT_RECLAIM,
         DIRECT_RECLAIM_THROTTLE,
     };
@@ -3716,13 +3715,6 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
-        reclaim = KSWAPD_RECLAIM;
-    } else if (vs.field.pgrefill != init_pgrefill) {
-        init_pgrefill = vs.field.pgrefill;
-        for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
-            init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
-        }
-    } else if (workingset_refault_file == prev_workingset_refault) {
         /*
          * On a system with only 2 zones, pgrefill indicating that pages are not eligible.
          * Then there may be real refilling happens for normal zone pages too.
@@ -3733,7 +3725,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         if (MGLRU_status) {
             pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_MOVABLE)] = 1;
         }
-        reclaim = PGREFILL;
+        reclaim = KSWAPD_RECLAIM;
     } else if (workingset_refault_file == prev_workingset_refault) {
         if (enable_preferred_apps &&
                   (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
