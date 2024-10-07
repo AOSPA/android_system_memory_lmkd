@@ -4520,11 +4520,15 @@ static void mainloop(void) {
          */
         for (i = 0, evt = &events[0]; i < nevents; ++i, evt++) {
             if ((evt->events & EPOLLHUP) && evt->data.ptr) {
-                ALOGI("lmkd data connection dropped");
                 handler_info = (struct event_handler_info*)evt->data.ptr;
-                watchdog.start();
-                ctrl_data_close(handler_info->data);
-                watchdog.stop();
+                if (handler_info->handler == kill_done_handler) {
+                    call_handler(handler_info, &poll_params, evt->events);
+                } else {
+                    ALOGI("lmkd data connection dropped");
+                    watchdog.start();
+                    ctrl_data_close(handler_info->data);
+                    watchdog.stop();
+                }
             }
         }
 
