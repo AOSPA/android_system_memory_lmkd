@@ -3693,6 +3693,7 @@ update_watermarks:
     } else if (reclaim == DIRECT_RECLAIM_THROTTLE) {
         kill_reason = DIRECT_RECL_AND_THROT;
         strlcpy(kill_desc, "system processes are being throttled", sizeof(kill_desc));
+        kill_desc[sizeof(kill_desc) - 1] = '\0';
     } else if (level == VMPRESS_LEVEL_CRITICAL && wmark <= WMARK_HIGH) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
@@ -3717,6 +3718,7 @@ update_watermarks:
          */
         kill_reason = NOT_RESPONDING;
         strlcpy(kill_desc, "device is not responding", sizeof(kill_desc));
+        kill_desc[sizeof(kill_desc) - 1] = '\0';
     } else if (swap_is_low && thrashing > thrashing_limit_pct) {
         /* Page cache is thrashing while swap is low */
         kill_reason = LOW_SWAP_AND_THRASHING;
