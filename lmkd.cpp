@@ -3358,7 +3358,18 @@ static int calc_swap_utilization(union meminfo *mi) {
     return total_swappable > 0 ? (swap_used * 100) / total_swappable : 0;
 }
 
-static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_params) {
+enum event_source {
+    PSI,
+    VENDOR,
+};
+
+union psi_event_data {
+    enum vmpressure_level level;
+    mem_event_t vendor_event;
+};
+
+static void __mp_event_psi(enum event_source source, union psi_event_data data,
+                           uint32_t events, struct polling_params *poll_params) {
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
@@ -3390,7 +3401,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     struct timespec curr_tm;
     int64_t thrashing = 0;
     bool swap_is_low = false;
-    enum vmpressure_level level = (enum vmpressure_level)data;
+    enum vmpressure_level level = (source == PSI) ? data.level: (enum vmpressure_level)0;
     enum kill_reasons kill_reason = NONE;
     bool cycle_after_kill = false;
     enum reclaim_state reclaim = NO_RECLAIM;
@@ -3412,7 +3423,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
              "triggered" : "polling check");
 
     if (events &&
-       (!poll_params->poll_handler || data >= poll_params->poll_handler->data)) {
+       (!poll_params->poll_handler || data.level >= poll_params->poll_handler->data)) {
            wbf_effective = wmark_boost_factor;
     }
     bool in_direct_reclaim;
@@ -3421,8 +3432,11 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
 
     mp_event_count++;
     if (debug_process_killing) {
-        ALOGI("%s memory pressure event #%" PRIu64 " is triggered",
-              level_name[level], mp_event_count);
+        if (source == PSI)
+            ALOGI("%s memory pressure event #%" PRIu64 " is triggered",
+                  level_name[level], mp_event_count);
+        else
+            ALOGI("vendor kill event #%" PRIu64 " is triggered", mp_event_count);
     }
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
@@ -3430,21 +3444,23 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         return;
     }
 
-    if (events > 0 ) {
-        /* Ignore a lower event within the first polling window. */
-        if (level < prev_level) {
-            if (debug_process_killing)
-                ALOGI("Ignoring %s pressure event; occurred too soon.",
-                       level_name[level]);
-            return;
+    if (source == PSI) {
+        if (events > 0 ) {
+            /* Ignore a lower event within the first polling window. */
+            if (level < prev_level) {
+                if (debug_process_killing)
+                    ALOGI("Ignoring %s pressure event; occurred too soon.",
+                           level_name[level]);
+                return;
+            }
+            prev_level = level;
+        } else {
+            /* Reset event level after the first polling window. */
+            prev_level = VMPRESS_LEVEL_LOW;
         }
-        prev_level = level;
-    } else {
-        /* Reset event level after the first polling window. */
-        prev_level = VMPRESS_LEVEL_LOW;
-    }
 
-    record_wakeup_time(&curr_tm, events ? Event : Polling, &wi);
+        record_wakeup_time(&curr_tm, events ? Event : Polling, &wi);
+    }
 
     if (level == VMPRESS_LEVEL_MEDIUM) {
         if (enable_preferred_apps &&
@@ -3596,7 +3612,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
               last_pa_update_tm = curr_tm;
         }
 
-        if (!in_compaction) {
+        if (!in_compaction || source == PSI) {
             /* Skip if system is not reclaiming */
             ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim or compaction and no refaults",
                      level_name[level]);
@@ -3677,7 +3693,23 @@ update_watermarks:
      * TODO: move this logic into a separate function
      * Decide if killing a process is necessary and record the reason
      */
-    if (cycle_after_kill && wmark <= WMARK_LOW) {
+    if (source == VENDOR) {
+        int vendor_kill_reason = data.vendor_event.event_data.vendor_kill.reason;
+        short vendor_kill_min_oom_score_adj =
+            data.vendor_event.event_data.vendor_kill.min_oom_score_adj;
+        if (vendor_kill_reason < 0 ||
+            vendor_kill_reason > VENDOR_KILL_REASON_END ||
+            vendor_kill_min_oom_score_adj < 0) {
+            ALOGE("Invalid vendor kill reason %d, min_oom_score_adj %d",
+                  vendor_kill_reason, vendor_kill_min_oom_score_adj);
+            return;
+        }
+
+        kill_reason = (enum kill_reasons)(vendor_kill_reason + VENDOR_KILL_REASON_BASE);
+        min_score_adj = vendor_kill_min_oom_score_adj;
+        snprintf(kill_desc, sizeof(kill_desc),
+            "vendor kill with the reason %d, min_score_adj %d", kill_reason, min_score_adj);
+    } else if (cycle_after_kill && wmark <= WMARK_LOW) {
         /*
          * Prevent kills not freeing enough memory which might lead to OOM kill.
          * This might happen when a process is consuming memory faster than reclaim can
@@ -3874,7 +3906,7 @@ no_kill:
         if (count_upgraded_event >= psi_cont_event_thresh) {
             poll_params->update = POLLING_CRIT_UPGRADE;
             count_upgraded_event = 0;
-        } else if (!poll_params->poll_handler || data >= poll_params->poll_handler->data) {
+        } else if (!poll_params->poll_handler || data.level >= poll_params->poll_handler->data) {
             poll_params->update = POLLING_START;
             if (!killing) {
                 wbf_effective = std::max(wbf_effective - wbf_step, 1);
@@ -3892,6 +3924,11 @@ no_kill:
         /* By default use long intervals */
         poll_params->polling_interval_ms = PSI_POLL_PERIOD_LONG_MS;
     }
+}
+
+static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_params) {
+    union psi_event_data event_data = {.level = (enum vmpressure_level)data};
+    __mp_event_psi(PSI, event_data, events, poll_params);
 }
 
 static std::string GetCgroupAttributePath(const char* attr) {
@@ -3972,7 +4009,7 @@ static MemcgVersion memcg_version() {
 }
 
 static void memevent_listener_notification(int data __unused, uint32_t events __unused,
-                                           struct polling_params* poll_params __unused) {
+                                           struct polling_params* poll_params) {
     struct timespec curr_tm;
     std::vector<mem_event_t> mem_events;
 
@@ -4009,6 +4046,10 @@ static void memevent_listener_notification(int data __unused, uint32_t events __
                 kswapd_start_tm.tv_sec = 0;
                 kswapd_start_tm.tv_nsec = 0;
                 break;
+            case MEM_EVENT_VENDOR_LMK_KILL:
+                union psi_event_data event_data = {.vendor_event = mem_event};
+                 __mp_event_psi(VENDOR, event_data, 0, poll_params);
+                break;
         }
     }
 }
@@ -4041,6 +4082,10 @@ static bool init_memevent_listener_monitoring() {
         ALOGE("Failed to register kswapd memevents");
         memevent_listener.reset();
         return false;
+    }
+
+    if (!memevent_listener->registerEvent(MEM_EVENT_VENDOR_LMK_KILL)) {
+        ALOGI("Failed to register android_vendor_kill memevents");
     }
 
     int memevent_listener_fd = memevent_listener->getRingBufferFd();
