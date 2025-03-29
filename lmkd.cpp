@@ -231,6 +231,7 @@ static struct timespec last_kill_tm;
 enum vmpressure_level prev_level = VMPRESS_LEVEL_LOW;
 static bool monitors_initialized;
 static bool boot_completed_handled = false;
+static bool mem_event_update_zoneinfo_supported;
 
 /* lmkd configurable parameters */
 static bool is_userdebug_or_eng_build;
@@ -2569,6 +2570,11 @@ static struct proc *proc_get_heaviest(int oomadj) {
     char *tmp_taskname;
     char buf[LINE_MAX];
 
+
+    if ((curr != head) && (curr->next == head)) {
+        // Our list only has one process.  No need to access procfs for its size.
+        return (struct proc *)curr;
+    }
     while (curr != head) {
         int pid = ((struct proc *)curr)->pid;
         long tasksize = proc_get_size(pid);
@@ -3106,7 +3112,6 @@ struct zone_meminfo {
     int64_t nr_zone_inactive_file;
     int64_t nr_zone_active_file;
     struct zone_watermarks watermarks;
-
 };
 
 static bool should_consider_cache_free(uint32_t events, enum vmpressure_level level, bool in_compaction)
@@ -3129,6 +3134,7 @@ static bool should_consider_cache_free(uint32_t events, enum vmpressure_level le
     return false;
 }
 
+static struct zone_watermarks watermarks;
 /*
  * Returns lowest breached watermark or WMARK_NONE.
  */
@@ -3349,6 +3355,19 @@ static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_
              pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_HIGH)],
              pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_MOVABLE)]);
     }
+}
+
+static int update_zoneinfo_watermarks(struct zoneinfo *zi) {
+    if (zoneinfo_parse(zi) < 0) {
+        ALOGE("Failed to parse zoneinfo!");
+        return -1;
+    }
+    // TODO(b/406932837) additional parameter added to calc_zone_watermarks that needs
+    // to be accouted for this case.
+
+    // calc_zone_watermarks(zi, &watermarks);
+    // return 0;
+    return -1;
 }
 
 static int calc_swap_utilization(union meminfo *mi) {
@@ -4046,10 +4065,16 @@ static void memevent_listener_notification(int data __unused, uint32_t events __
                 kswapd_start_tm.tv_sec = 0;
                 kswapd_start_tm.tv_nsec = 0;
                 break;
-            case MEM_EVENT_VENDOR_LMK_KILL:
+            case MEM_EVENT_VENDOR_LMK_KILL: {
                 union psi_event_data event_data = {.vendor_event = mem_event};
                  __mp_event_psi(VENDOR, event_data, 0, poll_params);
                 break;
+            }
+            case MEM_EVENT_UPDATE_ZONEINFO: {
+                struct zoneinfo zi;
+                update_zoneinfo_watermarks(&zi);
+                break;
+            }
         }
     }
 }
@@ -4086,6 +4111,13 @@ static bool init_memevent_listener_monitoring() {
 
     if (!memevent_listener->registerEvent(MEM_EVENT_VENDOR_LMK_KILL)) {
         ALOGI("Failed to register android_vendor_kill memevents");
+    }
+
+    if (!memevent_listener->registerEvent(MEM_EVENT_UPDATE_ZONEINFO)) {
+        mem_event_update_zoneinfo_supported = false;
+        ALOGI("update_zoneinfo memevents are not supported");
+    } else {
+        mem_event_update_zoneinfo_supported = true;
     }
 
     int memevent_listener_fd = memevent_listener->getRingBufferFd();
