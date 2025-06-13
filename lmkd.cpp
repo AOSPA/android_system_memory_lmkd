@@ -45,6 +45,7 @@
 #include <vector>
 
 #include <BpfSyscallWrappers.h>
+#include <android-base/stringify.h>
 #include <android-base/unique_fd.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <cutils/properties.h>
@@ -105,9 +106,6 @@
 
 /* Defined as ProcessList.SYSTEM_ADJ in ProcessList.java */
 #define SYSTEM_ADJ (-900)
-
-#define STRINGIFY(x) STRINGIFY_INTERNAL(x)
-#define STRINGIFY_INTERNAL(x) #x
 
 #define PROCFS_PATH_MAX 64
 
