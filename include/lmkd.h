@@ -112,10 +112,30 @@ struct lmk_procprio {
     pid_t pid;
     uid_t uid;
     int oomadj;
+    int isSystemApp;
+    int isMainProc;
     enum proc_type ptype;
 };
 #define LMK_PROCPRIO_FIELD_COUNT 4
 #define LMK_PROCPRIO_SIZE (LMK_PROCPRIO_FIELD_COUNT * sizeof(int))
+
+#define LMK_PROCPRIO_FIELD_COUNT_EXT 6
+#define LMK_PROCPRIO_SIZE_EXT (LMK_PROCPRIO_FIELD_COUNT_EXT * sizeof(int))
+
+/*
+ * For LMK_PROCPRIO packet get its payload.
+ * Warning: no checks performed, caller should ensure valid parameters.
+ */
+static inline void lmkd_pack_get_procprio_ext(LMKD_CTRL_PACKET packet, int field_count,
+                                          struct lmk_procprio* params) {
+    params->pid = (pid_t)ntohl(packet[1]);
+    params->uid = (uid_t)ntohl(packet[2]);
+    params->oomadj = ntohl(packet[3]);
+    params->isSystemApp = ntohl(packet[4]);
+    params->isMainProc = ntohl(packet[5]);
+    /* if field is missing assume PROC_TYPE_APP for backward compatibility */
+    params->ptype = field_count > 5 ? (enum proc_type)ntohl(packet[6]) : PROC_TYPE_APP;
+}
 
 /*
  * For LMK_PROCPRIO packet get its payload.
@@ -357,6 +377,30 @@ static inline int lmkd_pack_get_procs_prio(LMKD_CTRL_PACKET packet, struct lmk_p
         params->procs[procs_idx].pid = (pid_t)ntohl(packet[packetIdx++]);
         params->procs[procs_idx].uid = (uid_t)ntohl(packet[packetIdx++]);
         params->procs[procs_idx].oomadj = ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].ptype = (enum proc_type)ntohl(packet[packetIdx++]);
+    }
+
+    return procs_count;
+}
+
+/*
+ * For LMK_PROCS_PRIO packet get its payload.
+ * Warning: no checks performed, caller should ensure valid parameters.
+ */
+static inline int lmkd_pack_get_procs_prio_ext(LMKD_CTRL_PACKET packet, struct lmk_procs_prio* params,
+                                           const int field_count) {
+    if (field_count < LMK_PROCPRIO_FIELD_COUNT_EXT || (field_count % LMK_PROCPRIO_FIELD_COUNT_EXT) != 0)
+        return -1;
+    const int procs_count = (field_count / LMK_PROCPRIO_FIELD_COUNT_EXT);
+
+    /* Start packet at 1 since 0 is cmd type */
+    int packetIdx = 1;
+    for (int procs_idx = 0; procs_idx < procs_count; procs_idx++) {
+        params->procs[procs_idx].pid = (pid_t)ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].uid = (uid_t)ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].oomadj = ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].isSystemApp = ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].isMainProc = ntohl(packet[packetIdx++]);
         params->procs[procs_idx].ptype = (enum proc_type)ntohl(packet[packetIdx++]);
     }
 
