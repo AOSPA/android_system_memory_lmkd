@@ -3148,6 +3148,8 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     int64_t file_cache;
     int64_t breached_wm_level = 0;
     zone_watermark zm_breached = WMARK_NONE;
+    int64_t nr_swapcached = mi->field.swap_cached / page_k;
+    nr_free_pages += nr_swapcached;
 
     if (should_consider_cache_free(events, level, in_compaction)) {
         file_cache = zmi->nr_zone_inactive_file + zmi->nr_zone_active_file;
@@ -3173,11 +3175,12 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
         }
 
         ULMK_LOG(D, "Aggregate wmarks: min: %ld low: %ld high: %ld (nr_free - nr_cma_free): %ld wbf_effective: %d",
-             watermarks->min_wmark, watermarks->low_wmark*wbf_effective, watermarks->high_wmark*wbf_effective, nr_free_pages, wbf_effective);
+             watermarks->min_wmark, watermarks->low_wmark*wbf_effective, watermarks->high_wmark*wbf_effective,
+             nr_free_pages - nr_swapcached, wbf_effective);
 
         ULMK_LOG(D, "smallest wmark breached: %s free_pages: %" PRId64
-             " cached_pages_considered_free: %" PRId64 " breached_wm_level: %" PRId64,
-             wmark_str[zm_breached], nr_free_pages, nr_cached_pages, breached_wm_level);
+             " cached_pages_considered_free: %" PRId64 " swapcached_included: %" PRId64 " breached_wm_level: %" PRId64,
+             wmark_str[zm_breached], nr_free_pages - nr_swapcached, nr_cached_pages, nr_swapcached, breached_wm_level);
     }
 
     return zm_breached;
