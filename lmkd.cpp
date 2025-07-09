@@ -263,6 +263,11 @@ static Reaper reaper;
 static int reaper_comm_fd[2];
 static int32_t MGLRU_status = 0;
 
+static bool lazy_kill_main_proc = false;
+static bool lazy_killing_3rd_app_main_proc = false;
+static bool use_harden_limit = false;
+static int total_available_threshold_kb = 800 * 1024;
+
 enum polling_update {
     POLLING_DO_NOT_CHANGE,
     POLLING_START,
@@ -592,6 +597,9 @@ struct proc {
     int oomadj;
     pid_t reg_pid; /* PID of the process that registered this record */
     bool valid;
+    int isSystemApp;
+    int isMainProc;
+    bool isThirdPartyMainProc;
     struct proc *pidhash_next;
 };
 
@@ -1363,6 +1371,15 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         procp->reg_pid = cred->pid;
         procp->oomadj = oom_adj_score;
         procp->valid = true;
+        if (lazy_killing_3rd_app_main_proc) {
+            procp->isSystemApp = proc.isSystemApp;
+            procp->isMainProc = proc.isMainProc;
+            if (procp->isSystemApp == 0 && procp->isMainProc == 1) {
+                procp->isThirdPartyMainProc = true;
+            } else {
+                procp->isThirdPartyMainProc = false;
+            }
+        }
         proc_insert(procp);
     } else {
         if (!claim_record(procp, cred->pid)) {
@@ -1428,7 +1445,11 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
 static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred* cred) {
     struct lmk_procprio proc_prio;
 
-    lmkd_pack_get_procprio(packet, field_count, &proc_prio);
+    if (lazy_killing_3rd_app_main_proc) {
+        lmkd_pack_get_procprio_ext(packet, field_count, &proc_prio);
+    } else {
+        lmkd_pack_get_procprio(packet, field_count, &proc_prio);
+    }
     apply_proc_prio(proc_prio, cred);
 }
 
@@ -1641,8 +1662,14 @@ static void cmd_target(int ntargets, LMKD_CTRL_PACKET packet) {
 
 static void cmd_procs_prio(LMKD_CTRL_PACKET packet, const int field_count, struct ucred* cred) {
     struct lmk_procs_prio params;
+    int procs_count;
 
-    const int procs_count = lmkd_pack_get_procs_prio(packet, &params, field_count);
+    if (lazy_killing_3rd_app_main_proc) {
+        procs_count = lmkd_pack_get_procs_prio_ext(packet, &params, field_count);
+    } else {
+        procs_count = lmkd_pack_get_procs_prio(packet, &params, field_count);
+    }
+
     if (procs_count < 0) {
         ALOGE("LMK_PROCS_PRIO received invalid packet format");
         return;
@@ -1687,8 +1714,13 @@ static void ctrl_command_handler(int dsock_idx) {
         break;
     case LMK_PROCPRIO:
         /* process type field is optional for backward compatibility */
-        if (nargs < 3 || nargs > 4)
-            goto wronglen;
+        if (lazy_killing_3rd_app_main_proc) {
+            if (nargs < 5 || nargs > 6)
+                goto wronglen;
+        } else {
+            if (nargs < 3 || nargs > 4)
+                goto wronglen;
+        }
         cmd_procprio(packet, nargs, &cred);
         break;
     case LMK_PROCREMOVE:
@@ -2540,6 +2572,15 @@ static struct proc *proc_get_heaviest(int oomadj) {
 
 
     if ((curr != head) && (curr->next == head)) {
+        if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc &&
+                ((struct proc *)curr)->isThirdPartyMainProc) {
+            if (debug_process_killing) {
+                char buf[BUF_MAX];
+                ALOGE("Skip scan one process of list, due to %s is UI process.",
+                    proc_get_name(((struct proc *)curr)->pid, buf, sizeof(buf)));
+            }
+            return NULL;
+        }
         // Our list only has one process.  No need to access procfs for its size.
         return (struct proc *)curr;
     }
@@ -2552,6 +2593,14 @@ static struct proc *proc_get_heaviest(int oomadj) {
             curr = next;
         } else {
             tmp_taskname = proc_get_name(pid, buf, sizeof(buf));
+            if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc &&
+                    ((struct proc *)curr)->isThirdPartyMainProc) {
+                if (debug_process_killing) {
+                    ALOGE("Skip scan, due to %s is UI process.", tmp_taskname);
+                }
+                curr = curr->next;
+                continue;
+            }
             if (enable_preferred_apps && tmp_taskname != NULL && strstr(preferred_apps, tmp_taskname)) {
                 if (tasksize > maxsize_pa) {
                     maxsize_pa = tasksize;
@@ -2963,6 +3012,12 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
     int i;
     int killed_size = 0;
     bool choose_heaviest_task = kill_heaviest_task;
+
+    if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc) {
+        if (min_score_adj <= VISIBLE_APP_ADJ) {
+            min_score_adj = VISIBLE_APP_ADJ + 1;
+        }
+    }
 
     for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
         struct proc *procp;
@@ -3837,6 +3892,20 @@ update_watermarks:
         min_score_adj = lowmem_min_oom_score;
     }
 
+    if (use_harden_limit && kill_reason != NONE) {
+        int total_available_kb =
+            (mi.field.cached + mi.field.swap_cached + mi.field.nr_free_pages) * page_k;
+        if (total_available_kb > total_available_threshold_kb) {
+            kill_reason = NONE;
+            if (debug_process_killing) {
+                ALOGE("Skip killing, total_available_kb: %" PRId64 " kB "
+                        "total_available_threshold_kb: %" PRId64 " kB "
+                        "previous reason: %s",
+                        total_available_kb, total_available_threshold_kb, kill_desc);
+            }
+        }
+    }
+
     /* Kill a process if necessary */
     if (kill_reason != NONE) {
         struct kill_info ki = {
@@ -3860,7 +3929,15 @@ update_watermarks:
         }
         psi_parse_io(&psi_data);
         psi_parse_cpu(&psi_data);
-        int pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
+        int pages_freed = 0;
+        if (lazy_killing_3rd_app_main_proc) {
+            lazy_kill_main_proc = true;
+            pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
+            lazy_kill_main_proc = false;
+        }
+        if (pages_freed <= 0) {
+            pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
+        }
         if (pages_freed > 0) {
             killing = true;
             max_thrashing = 0;
@@ -4911,6 +4988,18 @@ static void update_perf_props() {
         snprintf(default_value, PROPERTY_VALUE_MAX, "%f", cache_percent);
         strlcpy(property, perf_get_prop("ro.lmk.cache_percent", default_value).value, PROPERTY_VALUE_MAX);
         cache_percent = (float)(strtod(property, NULL) * 0.01);
+
+        strlcpy(property, perf_get_prop("ro.lmk.lazy_killing_3rd_app_main_proc", "false").value, PROPERTY_VALUE_MAX);
+        lazy_killing_3rd_app_main_proc = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
+
+        snprintf(default_value, PROPERTY_VALUE_MAX, "%lu", (total_available_threshold_kb));
+        strlcpy(property, perf_get_prop("ro.lmk.total_available_threshold_kb", default_value).value,
+            PROPERTY_VALUE_MAX);
+        total_available_threshold_kb = strtod(property, NULL);
+
+        strlcpy(property, perf_get_prop("ro.lmk.use_harden_limit", "false").value,
+            PROPERTY_VALUE_MAX);
+        use_harden_limit = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
 
         //Update kernel interface during re-init.
         use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
