@@ -39,12 +39,13 @@ enum lmk_cmd {
     LMK_START_MONITORING,   /* Start psi monitoring if it was skipped earlier */
     LMK_BOOT_COMPLETED,     /* Notify LMKD boot is completed */
     LMK_PROCS_PRIO,         /* Register processes and set the same oom_adj_score */
+    LMK_UPDATE_LAZY_KILL_FLAG, /* Update lazy kill flag */
 };
 
 /*
  * Max number of targets in LMK_TARGET command.
  */
-#define MAX_TARGETS 6
+#define MAX_TARGETS 9
 
 #define MAX_PROCS_PRIO_RECORD_COUNT 3
 
@@ -122,8 +123,7 @@ struct lmk_procprio {
     pid_t pid;
     uid_t uid;
     int oomadj;
-    int isSystemApp;
-    int isMainProc;
+    int weight;
     enum proc_type ptype;
     // Whether this procprio is for lmkd only. If set, the procprio update will
     // not be sent to kernel.
@@ -131,7 +131,7 @@ struct lmk_procprio {
 };
 #define LMK_PROCPRIO_SIZE (LMK_PROCPRIO_FIELD_COUNT * sizeof(int))
 
-#define LMK_PROCPRIO_FIELD_COUNT_EXT 6
+#define LMK_PROCPRIO_FIELD_COUNT_EXT 5
 #define LMK_PROCPRIO_SIZE_EXT (LMK_PROCPRIO_FIELD_COUNT_EXT * sizeof(int))
 
 /*
@@ -143,10 +143,9 @@ static inline void lmkd_pack_get_procprio_ext(LMKD_CTRL_PACKET packet, int field
     params->pid = (pid_t)ntohl(packet[1]);
     params->uid = (uid_t)ntohl(packet[2]);
     params->oomadj = ntohl(packet[3]);
-    params->isSystemApp = ntohl(packet[4]);
-    params->isMainProc = ntohl(packet[5]);
+    params->weight = ntohl(packet[4]);
     /* if field is missing assume PROC_TYPE_APP for backward compatibility */
-    params->ptype = field_count > 5 ? (enum proc_type)ntohl(packet[6]) : PROC_TYPE_APP;
+    params->ptype = field_count > 4 ? (enum proc_type)ntohl(packet[5]) : PROC_TYPE_APP;
 }
 
 /*
@@ -415,8 +414,7 @@ static inline int lmkd_pack_get_procs_prio_ext(LMKD_CTRL_PACKET packet, struct l
         params->procs[procs_idx].pid = (pid_t)ntohl(packet[packetIdx++]);
         params->procs[procs_idx].uid = (uid_t)ntohl(packet[packetIdx++]);
         params->procs[procs_idx].oomadj = ntohl(packet[packetIdx++]);
-        params->procs[procs_idx].isSystemApp = ntohl(packet[packetIdx++]);
-        params->procs[procs_idx].isMainProc = ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].weight = ntohl(packet[packetIdx++]);
         params->procs[procs_idx].ptype = (enum proc_type)ntohl(packet[packetIdx++]);
     }
 
