@@ -289,6 +289,8 @@ static int32_t MGLRU_status = 0;
 
 static bool lazy_kill_main_proc = false;
 static bool lazy_killing_3rd_app_main_proc = false;
+static bool use_harden_limit = false;
+static int total_available_threshold_kb = 800 * 1024;
 
 enum polling_update {
     POLLING_DO_NOT_CHANGE,
@@ -3913,6 +3915,20 @@ update_watermarks:
         min_score_adj = lowmem_min_oom_score;
     }
 
+    if (use_harden_limit && kill_reason != NONE) {
+        int total_available_kb =
+            (mi.field.cached + mi.field.swap_cached + mi.field.nr_free_pages) * page_k;
+        if (total_available_kb > total_available_threshold_kb) {
+            kill_reason = NONE;
+            if (debug_process_killing) {
+                ALOGE("Skip killing, total_available_kb: %" PRId64 " kB "
+                        "total_available_threshold_kb: %" PRId64 " kB "
+                        "previous reason: %s",
+                        total_available_kb, total_available_threshold_kb, kill_desc);
+            }
+        }
+    }
+
     /* Kill a process if necessary */
     if (kill_reason != NONE) {
         struct kill_info ki = {
@@ -4978,6 +4994,15 @@ static void update_perf_props() {
 
         strlcpy(property, perf_get_prop("ro.lmk.lazy_killing_3rd_app_main_proc", "false").value, PROPERTY_VALUE_MAX);
         lazy_killing_3rd_app_main_proc = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
+
+        snprintf(default_value, PROPERTY_VALUE_MAX, "%lu", (total_available_threshold_kb));
+        strlcpy(property, perf_get_prop("ro.lmk.total_available_threshold_kb", default_value).value,
+            PROPERTY_VALUE_MAX);
+        total_available_threshold_kb = strtod(property, NULL);
+
+        strlcpy(property, perf_get_prop("ro.lmk.use_harden_limit", "false").value,
+            PROPERTY_VALUE_MAX);
+        use_harden_limit = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
 
         //Update kernel interface during re-init.
         use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
