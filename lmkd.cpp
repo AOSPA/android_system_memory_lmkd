@@ -155,6 +155,8 @@
 #define DEF_DIRECT_RECL_THRESH_MS 0
 /* ro.lmk.swap_compression_ratio property defaults */
 #define DEF_SWAP_COMP_RATIO 1
+/* ro.lmk.swap_compression_ratio_div property defaults */
+#define DEF_SWAP_COMP_RATIO_DIV 1
 /* ro.lmk.lowmem_min_oom_score defaults */
 #define DEF_LOWMEM_MIN_SCORE (PREVIOUS_APP_ADJ + 1)
 
@@ -246,6 +248,8 @@ static int psi_poll_period_scrit_ms = PSI_POLL_PERIOD_SHORT_MS;
 static bool delay_monitors_until_boot;
 static int direct_reclaim_threshold_ms;
 static int swap_compression_ratio;
+static int swap_compression_ratio_div;
+static bool relaxed_available_memory;
 static int lowmem_min_oom_score;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
     { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
@@ -451,9 +455,11 @@ enum meminfo_field {
     MI_ION_HELP,
     MI_ION_HELP_POOL,
     MI_CMA_FREE,
+    MI_DIRTY,
     MI_FIELD_COUNT
 };
 
+// clang-format off
 static const char* const meminfo_field_names[MI_FIELD_COUNT] = {
     "MemFree:",
     "Cached:",
@@ -473,7 +479,9 @@ static const char* const meminfo_field_names[MI_FIELD_COUNT] = {
     "ION_heap:",
     "ION_heap_pool:",
     "CmaFree:",
+    "Dirty:",
 };
+// clang-format on
 
 union meminfo {
     struct {
@@ -495,6 +503,7 @@ union meminfo {
         int64_t ion_heap;
         int64_t ion_heap_pool;
         int64_t cma_free;
+        int64_t dirty;
         /* fields below are calculated rather than read from the file */
         int64_t total_gpu_kb;
         int64_t easy_available;
@@ -2176,7 +2185,23 @@ static int meminfo_parse(union meminfo *mi) {
         }
     }
     mi->field.total_gpu_kb = read_gpu_total_kb();
-    mi->field.easy_available = mi->field.nr_free_pages + mi->field.inactive_file;
+
+    mi->field.easy_available = mi->field.nr_free_pages;
+    if (relaxed_available_memory && swap_compression_ratio) {
+        mi->field.easy_available += mi->field.active_file + mi->field.inactive_file;
+        mi->field.easy_available -= mi->field.dirty;
+
+        int64_t anon_pages = mi->field.active_anon + mi->field.inactive_anon;
+        /**
+         * Reclaiming anonymous memory only frees up this much memory:
+         *  anon_pages - (anon_pages / (swap_compression_ratio / swap_compression_ratio_div))
+         * After a little algebra, that becomes:
+         */
+        mi->field.easy_available += (swap_compression_ratio - swap_compression_ratio_div) *
+                                    anon_pages / swap_compression_ratio;
+    } else {
+        mi->field.easy_available += mi->field.inactive_file;
+    }
 
     return 0;
 }
@@ -2189,7 +2214,8 @@ static int meminfo_parse(union meminfo *mi) {
 // By setting swap_compression_ratio to 0, available memory can be ignored.
 static inline int64_t get_free_swap(union meminfo *mi) {
     if (swap_compression_ratio)
-        return std::min(mi->field.free_swap, mi->field.easy_available * swap_compression_ratio);
+        return std::min(mi->field.free_swap, mi->field.easy_available * swap_compression_ratio /
+                                                     swap_compression_ratio_div);
     return mi->field.free_swap;
 }
 
@@ -5058,6 +5084,9 @@ static bool update_props() {
             GET_LMK_PROPERTY(int64, "direct_reclaim_threshold_ms", DEF_DIRECT_RECL_THRESH_MS);
     swap_compression_ratio =
             GET_LMK_PROPERTY(int64, "swap_compression_ratio", DEF_SWAP_COMP_RATIO);
+    swap_compression_ratio_div =
+            GET_LMK_PROPERTY(int64, "swap_compression_ratio_div", DEF_SWAP_COMP_RATIO_DIV);
+    relaxed_available_memory = GET_LMK_PROPERTY(bool, "relaxed_available_memory", false);
     lowmem_min_oom_score =
             std::max(PERCEPTIBLE_APP_ADJ + 1,
                      GET_LMK_PROPERTY(int32, "lowmem_min_oom_score", DEF_LOWMEM_MIN_SCORE));
