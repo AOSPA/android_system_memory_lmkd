@@ -3689,7 +3689,7 @@ static void __mp_event_psi(enum event_source source, union psi_event_data data,
               last_pa_update_tm = curr_tm;
         }
 
-        if (!in_compaction || source == PSI) {
+        if (!in_compaction) {
             /* Skip if system is not reclaiming */
             ULMK_LOG(D, "Ignoring %s pressure event; system is not in reclaim or compaction and no refaults",
                      level_name[level]);
