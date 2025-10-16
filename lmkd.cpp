@@ -3658,6 +3658,17 @@ static void __mp_event_psi(enum event_source source, union psi_event_data data,
         in_direct_reclaim =
                 direct_reclaim_start_tm.tv_sec != 0 || direct_reclaim_start_tm.tv_nsec != 0;
         in_kswapd_reclaim = kswapd_start_tm.tv_sec != 0 || kswapd_start_tm.tv_nsec != 0;
+        /*
+         * when work with hw async compression, reclaim will end ealier than the real end time
+         * check vmstats again to avoid miss the reclaim status
+         */
+        if (!in_direct_reclaim) {
+            in_direct_reclaim = vs.field.pgscan_direct != init_pgscan_direct;
+        }
+        if (!in_kswapd_reclaim) {
+            in_kswapd_reclaim = (vs.field.pgscan_kswapd != init_pgscan_kswapd) ||
+                                (vs.field.pgrefill != init_pgrefill);
+        }
     } else {
         in_direct_reclaim = vs.field.pgscan_direct != init_pgscan_direct;
         in_kswapd_reclaim = (vs.field.pgscan_kswapd != init_pgscan_kswapd) ||
