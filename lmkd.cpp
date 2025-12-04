@@ -48,6 +48,7 @@
 #include <android-base/stringify.h>
 #include <android-base/unique_fd.h>
 #include <bpf/WaitForProgsLoaded.h>
+#include <com_android_memory_lmkd_flags.h>
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
 #include <liblmkd_utils.h>
@@ -68,6 +69,8 @@
 
 #define ATRACE_TAG ATRACE_TAG_ALWAYS
 #include <cutils/trace.h>
+
+using ::com::android::memory::lmkd::flags::lmkd_use_dmabuf_size;
 
 #ifndef __unused
 #define __unused __attribute__((__unused__))
@@ -141,6 +144,8 @@
 /* ro.lmk.thrashing_limit property defaults */
 #define DEF_THRASHING_LOWRAM 30
 #define DEF_THRASHING 30
+/* ro.lmk.thrashing_limit_critical property defaults */
+#define DEF_THRASHING_CRITICAL 300
 /* ro.lmk.thrashing_limit_decay property defaults */
 #define DEF_THRASHING_DECAY_LOWRAM 50
 #define DEF_THRASHING_DECAY 10
@@ -1304,6 +1309,31 @@ static char *proc_get_name(int pid, char *buf, size_t buf_size) {
     return buf;
 }
 
+static bool read_proc_dmabuf_stat(const char *filename, int pid, char *buf, size_t buf_size,
+                                  int64_t *dmabuf_rss_bytes) {
+    char path[PROCFS_PATH_MAX];
+    ssize_t size;
+    int fd;
+
+    if (!lmkd_use_dmabuf_size()) return false;
+
+    snprintf(path, PROCFS_PATH_MAX, "/proc/%d/%s", pid, filename);
+    fd = TEMP_FAILURE_RETRY(open(path, O_RDONLY | O_CLOEXEC));
+    if (fd < 0) {
+        return false;
+    }
+
+    size = read_all(fd, buf, buf_size - 1);
+    close(fd);
+    if (size <= 0) {
+        return false;
+    }
+
+    buf[size] = 0;
+
+    return parse_int64(buf, dmabuf_rss_bytes);
+}
+
 static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred* cred) {
     char val[20];
     int soft_limit_mult;
@@ -2384,7 +2414,8 @@ static void android_log_write_meminfo_field(android_log_context ctx, union memin
  * definition in event.logtags.
  */
 static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
-                         int swap_kb, struct kill_info *ki, union meminfo *mi,
+                         int swap_kb, int dmabuf_pss_kb, int dmabuf_rss_kb,
+                         struct kill_info *ki, union meminfo *mi,
                          struct wakeup_info *wi, struct timespec *tm, struct psi_data *pd) {
     /* log process information */
     android_log_write_int32(ctx, procp->pid);
@@ -2449,6 +2480,8 @@ static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
             android_log_write_float32(ctx, 0);
         }
     }
+    android_log_write_int32(ctx, std::min(dmabuf_pss_kb, (int)INT32_MAX));
+    android_log_write_int32(ctx, std::min(dmabuf_rss_kb, (int)INT32_MAX));
 
     android_log_write_list(ctx, LOG_ID_EVENTS);
     android_log_reset(ctx);
@@ -2618,13 +2651,12 @@ static struct proc *proc_get_heaviest(int oomadj) {
     struct adjslot_list *curr = head->next;
     struct proc *maxprocp = NULL;
     int maxsize = 0;
+    char buf[LINE_MAX];
 
     /* Filter out PApps */
     struct proc *maxprocp_pa = NULL;
     int maxsize_pa = 0;
     char *tmp_taskname;
-    char buf[LINE_MAX];
-
 
     if ((curr != head) && (curr->next == head)) {
         if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc &&
@@ -2642,6 +2674,12 @@ static struct proc *proc_get_heaviest(int oomadj) {
     while (curr != head) {
         int pid = ((struct proc *)curr)->pid;
         long tasksize = proc_get_size(pid);
+        int64_t dmabuf_pss_bytes;
+
+        // Include dmabuf_pss in the size calculation
+        if (read_proc_dmabuf_stat("dmabuf_pss", pid, buf, sizeof(buf), &dmabuf_pss_bytes))
+            tasksize += dmabuf_pss_bytes / getpagesize();
+
         if (tasksize < 0) {
             struct adjslot_list *next = curr->next;
             pid_remove(pid);
@@ -2826,7 +2864,7 @@ static void watchdog_callback() {
 
         if (target.valid && reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
             ALOGW("lmkd watchdog killed process %d, oom_score_adj %d", target.pid, oom_score);
-            killinfo_log(&target, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
+            killinfo_log(&target, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
             // Can't call pid_remove() from non-main thread, therefore just invalidate the record
             pid_invalidate(target.pid);
             break;
@@ -2962,6 +3000,10 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     struct kill_stat kill_st;
     int64_t tgid;
     int64_t rss_kb;
+    int64_t dmabuf_pss_bytes;
+    int64_t dmabuf_pss_kb;
+    int64_t dmabuf_rss_bytes;
+    int64_t dmabuf_rss_kb;
     int64_t swap_kb;
     char buf[BUF_MAX];
     char desc[LINE_MAX];
@@ -2983,6 +3025,18 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     }
     if (!parse_status_tag(buf, PROC_STATUS_SWAP_FIELD, &swap_kb)) {
         goto out;
+    }
+
+    if (read_proc_dmabuf_stat("dmabuf_pss", pid, buf, sizeof(buf), &dmabuf_pss_bytes)) {
+        dmabuf_pss_kb = dmabuf_pss_bytes / 1024;
+    } else {
+        dmabuf_pss_kb = dmabuf_pss_bytes = 0;
+    }
+
+    if (read_proc_dmabuf_stat("dmabuf_rss", pid, buf, sizeof(buf), &dmabuf_rss_bytes)) {
+        dmabuf_rss_kb = dmabuf_rss_bytes / 1024;
+    } else {
+        dmabuf_rss_kb = dmabuf_rss_bytes = 0;
     }
 
     taskname = proc_get_name(pid, buf, sizeof(buf));
@@ -3025,16 +3079,19 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
         kill_st.thrashing = ki->thrashing;
         kill_st.max_thrashing = ki->max_thrashing;
         ULMK_LOG(I,"Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
-              "kB swap; reason: %s", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb,
-              ki->kill_desc);
+              "kB swap, %" PRId64 "kB dmabuf_pss, %" PRId64 "kB dmabuf_rss; reason: %s",
+              taskname, pid, uid, procp->oomadj, rss_kb, swap_kb,
+              dmabuf_pss_kb, dmabuf_rss_kb, ki->kill_desc);
     } else {
         kill_st.kill_reason = NONE;
         kill_st.thrashing = 0;
         kill_st.max_thrashing = 0;
         ULMK_LOG(I,"Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
-              "kb swap", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb);
+              "kb swap, %" PRId64 "kB dmabuf_pss, %" PRId64 "kB dmabuf_rss",
+              taskname, pid, uid, procp->oomadj, rss_kb, swap_kb, dmabuf_pss_kb, dmabuf_rss_kb);
     }
-    killinfo_log(procp, min_oom_score, rss_kb, swap_kb, ki, mi, wi, tm, pd);
+    killinfo_log(procp, min_oom_score, rss_kb, swap_kb, dmabuf_pss_kb, dmabuf_rss_kb,
+                 ki, mi, wi, tm, pd);
 
     kill_st.uid = static_cast<int32_t>(uid);
     kill_st.taskname = taskname;
@@ -3656,6 +3713,17 @@ static void __mp_event_psi(enum event_source source, union psi_event_data data,
         in_direct_reclaim =
                 direct_reclaim_start_tm.tv_sec != 0 || direct_reclaim_start_tm.tv_nsec != 0;
         in_kswapd_reclaim = kswapd_start_tm.tv_sec != 0 || kswapd_start_tm.tv_nsec != 0;
+        /*
+         * when work with hw async compression, reclaim will end ealier than the real end time
+         * check vmstats again to avoid miss the reclaim status
+         */
+        if (!in_direct_reclaim) {
+            in_direct_reclaim = vs.field.pgscan_direct != init_pgscan_direct;
+        }
+        if (!in_kswapd_reclaim) {
+            in_kswapd_reclaim = (vs.field.pgscan_kswapd != init_pgscan_kswapd) ||
+                                (vs.field.pgrefill != init_pgrefill);
+        }
     } else {
         in_direct_reclaim = vs.field.pgscan_direct != init_pgscan_direct;
         in_kswapd_reclaim = (vs.field.pgscan_kswapd != init_pgscan_kswapd) ||
@@ -5080,7 +5148,7 @@ static bool update_props() {
     thrashing_limit_decay_pct = clamp(0, 100, GET_LMK_PROPERTY(int32, "thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
     thrashing_critical_pct = std::max(
-            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", thrashing_limit_pct * 3));
+            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", DEF_THRASHING_CRITICAL));
     swap_util_max = clamp(0, 100, GET_LMK_PROPERTY(int32, "swap_util_max", 100));
     filecache_min_kb = GET_LMK_PROPERTY(int64, "filecache_min_kb", 0);
     stall_limit_critical = GET_LMK_PROPERTY(int64, "stall_limit_critical", 100);
