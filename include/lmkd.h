@@ -46,12 +46,22 @@ enum lmk_cmd {
  */
 #define MAX_TARGETS 6
 
+#define MAX_PROCS_PRIO_RECORD_COUNT 3
+
+#define LMK_PROCPRIO_FIELD_COUNT 5
+
+#define MAX_LMK_TARGET_SIZE (MAX_TARGETS * 2 + 1)
+#define MAX_CTRL_PACKET_SIZE (LMK_PROCPRIO_FIELD_COUNT * MAX_PROCS_PRIO_RECORD_COUNT + 1)
+
 /*
  * Max packet length in bytes.
- * Longest packet is LMK_TARGET followed by MAX_TARGETS
- * of minfree and oom_adj_score values
+ * Sized to be the larger of LMK_TARGET and LMK_PROCS_PRIO commands.
  */
-#define CTRL_PACKET_MAX_SIZE (sizeof(int) * (MAX_TARGETS * 2 + 1))
+#if MAX_LMK_TARGET_SIZE > MAX_CTRL_PACKET_SIZE
+#define CTRL_PACKET_MAX_SIZE (sizeof(int) * MAX_LMK_TARGET_SIZE)
+#else
+#define CTRL_PACKET_MAX_SIZE (sizeof(int) * MAX_CTRL_PACKET_SIZE)
+#endif
 
 /*
  * Max size of work buffer
@@ -115,8 +125,10 @@ struct lmk_procprio {
     int isSystemApp;
     int isMainProc;
     enum proc_type ptype;
+    // Whether this procprio is for lmkd only. If set, the procprio update will
+    // not be sent to kernel.
+    bool for_lmkd_only;
 };
-#define LMK_PROCPRIO_FIELD_COUNT 4
 #define LMK_PROCPRIO_SIZE (LMK_PROCPRIO_FIELD_COUNT * sizeof(int))
 
 #define LMK_PROCPRIO_FIELD_COUNT_EXT 6
@@ -148,6 +160,8 @@ static inline void lmkd_pack_get_procprio(LMKD_CTRL_PACKET packet, int field_cou
     params->oomadj = ntohl(packet[3]);
     /* if field is missing assume PROC_TYPE_APP for backward compatibility */
     params->ptype = field_count > 3 ? (enum proc_type)ntohl(packet[4]) : PROC_TYPE_APP;
+    /* if field is missing assume false for backward compatibility */
+    params->for_lmkd_only = field_count > 4 ? (bool)ntohl(packet[5]) : false;
 }
 
 /*
@@ -160,7 +174,8 @@ static inline size_t lmkd_pack_set_procprio(LMKD_CTRL_PACKET packet, struct lmk_
     packet[2] = htonl(params->uid);
     packet[3] = htonl(params->oomadj);
     packet[4] = htonl((int)params->ptype);
-    return 5 * sizeof(int);
+    packet[5] = htonl((int)params->for_lmkd_only);
+    return 6 * sizeof(int);
 }
 
 /* LMK_PROCREMOVE packet payload */
@@ -378,6 +393,7 @@ static inline int lmkd_pack_get_procs_prio(LMKD_CTRL_PACKET packet, struct lmk_p
         params->procs[procs_idx].uid = (uid_t)ntohl(packet[packetIdx++]);
         params->procs[procs_idx].oomadj = ntohl(packet[packetIdx++]);
         params->procs[procs_idx].ptype = (enum proc_type)ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].for_lmkd_only = (bool)ntohl(packet[packetIdx++]);
     }
 
     return procs_count;
@@ -422,6 +438,7 @@ static inline size_t lmkd_pack_set_procs_prio(LMKD_CTRL_PACKET packet,
         packet[packetIdx++] = htonl(params->procs[i].uid);
         packet[packetIdx++] = htonl(params->procs[i].oomadj);
         packet[packetIdx++] = htonl((int)params->procs[i].ptype);
+        packet[packetIdx++] = htonl((int)params->procs[i].for_lmkd_only);
     }
 
     return packetIdx * sizeof(int);
