@@ -3166,9 +3166,21 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
             bool process_killed = false;
 
             for (int i = 0; i < WEIGHT_TO_SLOT_COUNT && !process_killed; i++) {
+                struct weightslot_list *head = &procweightslot_list[i];
+                struct weightslot_list *curr = head->prev;
                 struct proc *procp;
 
-                while ((procp = proc_weight_tail(i))) {
+                while (curr != head) {
+                    procp = container_of(curr, struct proc, wsl);
+                    struct weightslot_list *prev = curr->prev;
+
+                    // Kill weight processes (Weight 0->3), but SKIP foreground (adj == 0).
+                    // Skipped processes will be handled in last tier (Retry pass)
+                    if (lazy_kill_visible_proc_enabled && procp->oomadj == 0) {
+                        curr = prev;
+                        continue;
+                    }
+
                     killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
 
                     if (killed_size >= 0) {
@@ -3183,6 +3195,7 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
                         }
                         break; // Exit inner while loop
                     }
+                    curr = prev;
                 }
             }
         }
@@ -4057,6 +4070,15 @@ update_watermarks:
         psi_parse_io(&psi_data);
         psi_parse_cpu(&psi_data);
         int pages_freed = 0;
+        // Kill Tier:
+        // 1. Tier 4 (First): Ordinary Background Apps (Adj > 100)
+        //    - Handled by standard list in Pass 1.
+        // 2. Tier 3: Weighted Background Apps (Weight 0-3, Adj != 0)
+        //    - Handled by weight list in Pass 1.
+        // 3. Tier 2: Ordinary Visible Apps (Adj <= 100)
+        //    - Handled by standard list in Pass 2 (Retry).
+        // 4. Tier 1 (Last): Weighted Foreground Apps (Weight 0-3, Adj == 0)
+        //    - Handled by weight list in Pass 2 (Retry).
         pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
         if (pages_freed <= 0 && lazy_kill_weight_proc_enabled) {
             lazy_kill_visible_proc_enabled = false;
