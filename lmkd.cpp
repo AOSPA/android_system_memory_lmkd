@@ -240,7 +240,6 @@ static int thrashing_critical_pct;
 static int swap_util_max;
 static int64_t filecache_min_kb;
 static int64_t stall_limit_critical;
-static bool use_psi_monitors = false;
 static bool enable_preferred_apps =  false;
 static bool last_event_upgraded = false;
 static int count_upgraded_event;
@@ -3159,11 +3158,8 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
 
             killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
             if (killed_size >= 0) {
-                break;
+                return killed_size;
             }
-        }
-        if (killed_size) {
-            break;
         }
     }
 
@@ -4340,97 +4336,6 @@ static bool init_psi_monitors() {
     return true;
 }
 
-static bool init_mp_common(enum vmpressure_level level) {
-    // The implementation of this function relies on memcg statistics that are only available in the
-    // v1 cgroup hierarchy.
-    if (memcg_version() != MemcgVersion::kV1) {
-        ALOGE("%s: global monitoring is only available for the v1 cgroup hierarchy", __func__);
-        return false;
-    }
-
-    int mpfd;
-    int evfd;
-    int evctlfd;
-    char buf[256];
-    struct epoll_event epev;
-    int ret;
-    int level_idx = (int)level;
-    const char *levelstr = level_name[level_idx];
-
-    /* gid containing AID_SYSTEM required */
-    mpfd = open(GetCgroupAttributePath("MemPressureLevel").c_str(), O_RDONLY | O_CLOEXEC);
-    if (mpfd < 0) {
-        ALOGI("No kernel memory.pressure_level support (errno=%d)", errno);
-        goto err_open_mpfd;
-    }
-
-    evctlfd = open(GetCgroupAttributePath("MemCgroupEventControl").c_str(), O_WRONLY | O_CLOEXEC);
-    if (evctlfd < 0) {
-        ALOGI("No kernel memory cgroup event control (errno=%d)", errno);
-        goto err_open_evctlfd;
-    }
-
-    evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (evfd < 0) {
-        ALOGE("eventfd failed for level %s; errno=%d", levelstr, errno);
-        goto err_eventfd;
-    }
-
-    ret = snprintf(buf, sizeof(buf), "%d %d %s", evfd, mpfd, levelstr);
-    if (ret >= (ssize_t)sizeof(buf)) {
-        ALOGE("cgroup.event_control line overflow for level %s", levelstr);
-        goto err;
-    }
-
-    ret = TEMP_FAILURE_RETRY(write(evctlfd, buf, strlen(buf) + 1));
-    if (ret == -1) {
-        ALOGE("cgroup.event_control write failed for level %s; errno=%d",
-              levelstr, errno);
-        goto err;
-    }
-
-    epev.events = EPOLLIN;
-    /* use data to store event level */
-    vmpressure_hinfo[level_idx].data = level_idx;
-    vmpressure_hinfo[level_idx].handler = mp_event_psi;
-    epev.data.ptr = (void *)&vmpressure_hinfo[level_idx];
-    ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, evfd, &epev);
-    if (ret == -1) {
-        ALOGE("epoll_ctl for level %s failed; errno=%d", levelstr, errno);
-        goto err;
-    }
-    maxevents++;
-    mpevfd[level] = evfd;
-    close(evctlfd);
-    return true;
-
-err:
-    close(evfd);
-err_eventfd:
-    close(evctlfd);
-err_open_evctlfd:
-    close(mpfd);
-err_open_mpfd:
-    return false;
-}
-
-static void destroy_mp_common(enum vmpressure_level level) {
-    struct epoll_event epev;
-    int fd = mpevfd[level];
-
-    if (fd < 0) {
-        return;
-    }
-
-    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, &epev)) {
-        // Log an error and keep going
-        ALOGE("epoll_ctl for level %s failed; errno=%d", level_name[level], errno);
-    }
-    maxevents--;
-    close(fd);
-    mpevfd[level] = -1;
-}
-
 static void kernel_event_handler(int data __unused, uint32_t events __unused,
                                  struct polling_params *poll_params __unused) {
     poll_kernel(kpoll_fd);
@@ -4439,37 +4344,22 @@ static void kernel_event_handler(int data __unused, uint32_t events __unused,
 static bool init_monitors() {
     ALOGI("Wakeup counter is reset from %" PRIu64 " to 0", mp_event_count);
     mp_event_count = 0;
-    /* Try to use psi monitor first if kernel has it */
-    use_psi_monitors = GET_LMK_PROPERTY(bool, "use_psi", true) &&
-        init_psi_monitors();
-    /* Fall back to vmpressure */
-    if (!use_psi_monitors &&
-        (!init_mp_common(VMPRESS_LEVEL_LOW) ||
-        !init_mp_common(VMPRESS_LEVEL_MEDIUM) ||
-        !init_mp_common(VMPRESS_LEVEL_CRITICAL))) {
-        ALOGE("Kernel does not support memory pressure events or in-kernel low memory killer");
+
+    if (!init_psi_monitors()) {
+        ALOGE("Failed to initialize PSI monitors");
         return false;
     }
-    if (use_psi_monitors) {
-        ALOGI("Using psi monitors for memory pressure detection");
-    } else {
-        ALOGI("Using vmpressure for memory pressure detection");
-    }
+
+    ALOGI("Using psi monitors for memory pressure detection");
 
     monitors_initialized = true;
     return true;
 }
 
 static void destroy_monitors() {
-    if (use_psi_monitors) {
-        destroy_mp_psi(VMPRESS_LEVEL_SUPER_CRITICAL);
-        destroy_mp_psi(VMPRESS_LEVEL_CRITICAL);
-        destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
-    } else {
-        destroy_mp_common(VMPRESS_LEVEL_CRITICAL);
-        destroy_mp_common(VMPRESS_LEVEL_MEDIUM);
-        destroy_mp_common(VMPRESS_LEVEL_LOW);
-    }
+    destroy_mp_psi(VMPRESS_LEVEL_SUPER_CRITICAL);
+    destroy_mp_psi(VMPRESS_LEVEL_CRITICAL);
+    destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
 }
 
 static void drop_reaper_comm() {

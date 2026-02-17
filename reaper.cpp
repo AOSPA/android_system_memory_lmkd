@@ -101,9 +101,24 @@ void Reaper::victim_priority_setter() {
         auto [uid, pid] = setprio_queue_.pop();
 
         set_process_group_and_prio(uid, pid,
-                                   {"CPUSET_SP_FOREGROUND", "SCHED_SP_FOREGROUND"},
+                                   {"CPUSET_LMKD_REAP_TARGET", "SCHED_LMKD_REAP_TARGET"},
                                    ANDROID_PRIORITY_NORMAL);
     }
+}
+
+static int kill_cgroup_or_process(const Reaper::target_proc& target) {
+    // Try a cgroup kill first
+    if (!sendSignalToProcessGroup(target.uid, target.pid, SIGKILL)) {
+        // Most, *but not all* processes are in their own cgroups managed by Android, for example
+        // children of adbd. For these processes, the best thing we can do is kill the individual
+        // process.
+        if (target.pidfd >= 0) {
+            return pidfd_send_signal(target.pidfd, SIGKILL, NULL, 0);
+        }
+        return ::kill(target.pid, SIGKILL);
+    }
+
+    return 0;
 }
 
 void Reaper::reaper_main() {
@@ -126,7 +141,7 @@ void Reaper::reaper_main() {
             clock_gettime(CLOCK_MONOTONIC_COARSE, &start_tm);
         }
 
-        if (pidfd_send_signal(target.pidfd, SIGKILL, NULL, 0)) {
+        if (kill_cgroup_or_process(target)) {
             // Inform the main thread about failure to kill
             notify_kill_failure(target.pid);
             goto done;
@@ -185,6 +200,10 @@ bool Reaper::init(int comm_fd) {
         ALOGW("set SCHED_OTHER failed %s", strerror(errno));
     }
 
+    if (pthread_setname_np(setprio_thread_.native_handle(), "lmkd_setprio")) {
+        ALOGW("pthread_setname_np failed: %s", strerror(errno));
+    }
+
     thread_pool_.reserve(THREAD_POOL_SIZE);
     for (unsigned int i = 0; i < THREAD_POOL_SIZE; i++) {
         thread_pool_.push_back(std::thread(&Reaper::reaper_main, this));
@@ -203,7 +222,8 @@ bool Reaper::init(int comm_fd) {
 }
 
 bool Reaper::async_kill(const struct target_proc& target) {
-    if (target.pidfd == -1) {
+    // Required for process_mrelease
+    if (target.pidfd < 0) {
         return false;
     }
 
@@ -221,17 +241,12 @@ bool Reaper::async_kill(const struct target_proc& target) {
 }
 
 int Reaper::kill(const struct target_proc& target, bool synchronous) {
-    /* CAP_KILL required */
-    if (target.pidfd < 0) {
-        return ::kill(target.pid, SIGKILL);
-    }
-
     if (!synchronous && async_kill(target)) {
         // we assume the kill will be successful and if it fails we will be notified
         return 0;
     }
 
-    return pidfd_send_signal(target.pidfd, SIGKILL, NULL, 0);
+    return kill_cgroup_or_process(target);
 }
 
 void Reaper::notify_kill_failure(pid_t pid) {
