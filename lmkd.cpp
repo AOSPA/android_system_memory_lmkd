@@ -37,6 +37,7 @@
 #include <sys/sysinfo.h>
 #include <time.h>
 #include <unistd.h>
+#include <stddef.h>
 
 #include <algorithm>
 #include <array>
@@ -271,8 +272,8 @@ static Reaper reaper;
 static int reaper_comm_fd[2];
 static int32_t MGLRU_status = 0;
 
-static bool lazy_kill_main_proc = false;
-static bool lazy_killing_3rd_app_main_proc = false;
+static bool lazy_kill_weight_proc_enabled = false;
+static bool lazy_kill_visible_proc_enabled = true;
 static bool use_harden_limit = false;
 static int total_available_threshold_kb = 800 * 1024;
 
@@ -605,17 +606,21 @@ struct adjslot_list {
     struct adjslot_list *prev;
 };
 
+struct weightslot_list {
+    struct weightslot_list *next;
+    struct weightslot_list *prev;
+};
+
 struct proc {
     struct adjslot_list asl;
+    struct weightslot_list wsl;
     int pid;
     int pidfd;
     uid_t uid;
     int oomadj;
     pid_t reg_pid; /* PID of the process that registered this record */
     bool valid;
-    int isSystemApp;
-    int isMainProc;
-    bool isThirdPartyMainProc;
+    int weight;
     struct proc *pidhash_next;
 };
 
@@ -649,6 +654,13 @@ static std::shared_mutex adjslot_list_lock;
 // procadjslot_list should be modified only from the main thread while exclusively holding
 // adjslot_list_lock. Readers from non-main threads should hold adjslot_list_lock shared lock.
 static struct adjslot_list procadjslot_list[ADJTOSLOT_COUNT];
+
+#define DEFAULT_PROC_WEIGHT   -1
+#define WEIGHT_TO_SLOT_COUNT   (3 + 1)
+static struct weightslot_list procweightslot_list[WEIGHT_TO_SLOT_COUNT];
+
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
 
 #define MAX_DISTINCT_OOM_ADJ 64
 #define KILLCNT_INVALID_IDX 0xFF
@@ -1040,10 +1052,70 @@ static struct adjslot_list *adjslot_tail(struct adjslot_list *head) {
     return asl == head ? NULL : asl;
 }
 
+static void weightslot_insert(struct weightslot_list *head, struct weightslot_list *new_element)
+{
+    struct proc *new_proc = container_of(new_element, struct proc, wsl);
+    struct weightslot_list *curr = head->next;
+
+    /* Insert in sorted order by oomadj (ascending: smallest to largest) */
+    while (curr != head) {
+        struct proc *curr_proc = container_of(curr, struct proc, wsl);
+        if (new_proc->oomadj < curr_proc->oomadj) {
+            /* Found the insertion point */
+            break;
+        }
+        curr = curr->next;
+    }
+
+    /* Insert before curr */
+    new_element->next = curr;
+    new_element->prev = curr->prev;
+    curr->prev->next = new_element;
+    curr->prev = new_element;
+}
+
+static void weightslot_remove(struct weightslot_list *old)
+{
+    if (!old || !old->prev || !old->next) {
+        return;
+    }
+
+    struct weightslot_list *prev = old->prev;
+    struct weightslot_list *next = old->next;
+    next->prev = prev;
+    prev->next = next;
+}
+
+static struct weightslot_list *weightslot_tail(struct weightslot_list *head) {
+    struct weightslot_list *wsl = head->prev;
+
+    return wsl == head ? NULL : wsl;
+}
+
+static struct proc *proc_weight_tail(int weight) {
+    if (weight < 0 || weight >= WEIGHT_TO_SLOT_COUNT) {
+        return NULL;
+    }
+
+    struct weightslot_list *wsl = weightslot_tail(&procweightslot_list[weight]);
+    return wsl ? container_of(wsl, struct proc, wsl) : NULL;
+}
+
 // Should be modified only from the main thread.
 static void proc_slot(struct proc *procp) {
     int adjslot = ADJTOSLOT(procp->oomadj);
     std::scoped_lock lock(adjslot_list_lock);
+
+    if (lazy_kill_weight_proc_enabled) {
+        int weight = procp->weight;
+        bool non_weight_proc = (weight == DEFAULT_PROC_WEIGHT) ||
+            (weight >= WEIGHT_TO_SLOT_COUNT);
+
+        if (!non_weight_proc) {
+            weightslot_insert(&procweightslot_list[weight], &procp->wsl);
+            return;
+        }
+    }
 
     adjslot_insert(&procadjslot_list[adjslot], &procp->asl);
 }
@@ -1052,8 +1124,32 @@ static void proc_slot(struct proc *procp) {
 static void proc_unslot(struct proc *procp) {
     std::scoped_lock lock(adjslot_list_lock);
 
+    if (lazy_kill_weight_proc_enabled) {
+        int weight = procp->weight;
+        bool non_weight_proc = (weight == DEFAULT_PROC_WEIGHT) ||
+            (weight >= WEIGHT_TO_SLOT_COUNT);
+
+        if (!non_weight_proc) {
+            weightslot_remove(&procp->wsl);
+            return;
+        }
+    }
+
     adjslot_remove(&procp->asl);
 }
+
+static void move_weight_to_adj_slot() {
+    ALOGE("Move Weight slot proc to Adj slot");
+
+    for (int i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
+        struct proc *procp;
+        while ((procp = proc_weight_tail(i))) {
+            weightslot_remove(&procp->wsl);
+            proc_slot(procp);
+        }
+    }
+}
+
 
 static void proc_insert(struct proc *procp) {
     int hval = pid_hashfn(procp->pid);
@@ -1339,6 +1435,38 @@ static bool read_proc_dmabuf_stat(const char *filename, int pid, char *buf, size
     return parse_int64(buf, dmabuf_rss_bytes);
 }
 
+static bool proc_is_top_app(int pid) {
+    static char path[PATH_MAX];
+    static char buf[LINE_MAX];
+    int fd;
+    ssize_t ret;
+
+    /* Check if process is in top-app cpuset (foreground application) */
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+
+    ret = read_all(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (ret <= 0) {
+        return false;
+    }
+    buf[ret] = '\0';
+
+    /* Check if the process is in top-app cpuset
+     * The cgroup file contains lines like:
+     * 1:cpuset:/top-app
+     * We need to check if "top-app" is present in the cpuset controller
+     */
+    if (strstr(buf, "top-app") != NULL) {
+        return true;
+    }
+
+    return false;
+}
+
 static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred* cred) {
     char val[20];
     int soft_limit_mult;
@@ -1418,15 +1546,7 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         procp->reg_pid = cred->pid;
         procp->oomadj = oom_adj_score;
         procp->valid = true;
-        if (lazy_killing_3rd_app_main_proc) {
-            procp->isSystemApp = proc.isSystemApp;
-            procp->isMainProc = proc.isMainProc;
-            if (procp->isSystemApp == 0 && procp->isMainProc == 1) {
-                procp->isThirdPartyMainProc = true;
-            } else {
-                procp->isThirdPartyMainProc = false;
-            }
-        }
+        procp->weight = proc.weight;
         proc_insert(procp);
     } else {
         if (!claim_record(procp, cred->pid)) {
@@ -1439,6 +1559,7 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         }
         proc_unslot(procp);
         procp->oomadj = oom_adj_score;
+        procp->weight = proc.weight;
         proc_slot(procp);
     }
 }
@@ -1494,11 +1615,12 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
 static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred* cred) {
     struct lmk_procprio proc_prio;
 
-    if (lazy_killing_3rd_app_main_proc) {
+    if (lazy_kill_weight_proc_enabled) {
         lmkd_pack_get_procprio_ext(packet, field_count, &proc_prio);
     } else {
         lmkd_pack_get_procprio(packet, field_count, &proc_prio);
     }
+
     apply_proc_prio(proc_prio, cred);
 }
 
@@ -1713,7 +1835,7 @@ static void cmd_procs_prio(LMKD_CTRL_PACKET packet, const int field_count, struc
     struct lmk_procs_prio params;
     int procs_count;
 
-    if (lazy_killing_3rd_app_main_proc) {
+    if (lazy_kill_weight_proc_enabled) {
         procs_count = lmkd_pack_get_procs_prio_ext(packet, &params, field_count);
     } else {
         procs_count = lmkd_pack_get_procs_prio(packet, &params, field_count);
@@ -1763,8 +1885,8 @@ static void ctrl_command_handler(int dsock_idx) {
         break;
     case LMK_PROCPRIO:
         /* process type field is optional for backward compatibility */
-        if (lazy_killing_3rd_app_main_proc) {
-            if (nargs < 5 || nargs > 6)
+        if (lazy_kill_weight_proc_enabled) {
+            if (nargs < 4 || nargs > 5)
                 goto wronglen;
         } else {
             if (nargs < 3 || nargs > 5)
@@ -1876,6 +1998,19 @@ static void ctrl_command_handler(int dsock_idx) {
         break;
     case LMK_PROCS_PRIO:
         cmd_procs_prio(packet, nargs, &cred);
+        break;
+    case LMK_UPDATE_LAZY_KILL_FLAG:
+        if (nargs != 1)
+            goto wronglen;
+
+        if (ntohl(packet[1]) == 1) {
+            lazy_kill_weight_proc_enabled = true;
+            ALOGE("lazy_kill_weight_proc enabled");
+        } else if (ntohl(packet[1]) == 0) {
+            lazy_kill_weight_proc_enabled = false;
+            ALOGE("lazy_kill_weight_proc disabled");
+            move_weight_to_adj_slot();
+        }
         break;
     default:
         ALOGE("Received unknown command code %d", cmd);
@@ -2666,15 +2801,6 @@ static struct proc *proc_get_heaviest(int oomadj) {
     char *tmp_taskname;
 
     if ((curr != head) && (curr->next == head)) {
-        if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc &&
-                ((struct proc *)curr)->isThirdPartyMainProc) {
-            if (debug_process_killing) {
-                char buf[BUF_MAX];
-                ALOGE("Skip scan one process of list, due to %s is UI process.",
-                    proc_get_name(((struct proc *)curr)->pid, buf, sizeof(buf)));
-            }
-            return NULL;
-        }
         // Our list only has one process.  No need to access procfs for its size.
         return (struct proc *)curr;
     }
@@ -2693,14 +2819,6 @@ static struct proc *proc_get_heaviest(int oomadj) {
             curr = next;
         } else {
             tmp_taskname = proc_get_name(pid, buf, sizeof(buf));
-            if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc &&
-                    ((struct proc *)curr)->isThirdPartyMainProc) {
-                if (debug_process_killing) {
-                    ALOGE("Skip scan, due to %s is UI process.", tmp_taskname);
-                }
-                curr = curr->next;
-                continue;
-            }
             if (enable_preferred_apps && tmp_taskname != NULL && strstr(preferred_apps, tmp_taskname)) {
                 if (tasksize > maxsize_pa) {
                     maxsize_pa = tasksize;
@@ -3132,7 +3250,7 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
     int killed_size = 0;
     bool choose_heaviest_task = kill_heaviest_task;
 
-    if (lazy_killing_3rd_app_main_proc && lazy_kill_main_proc) {
+    if (lazy_kill_weight_proc_enabled && lazy_kill_visible_proc_enabled) {
         if (min_score_adj <= VISIBLE_APP_ADJ) {
             min_score_adj = VISIBLE_APP_ADJ + 1;
         }
@@ -3159,6 +3277,74 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
             killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
             if (killed_size >= 0) {
                 return killed_size;
+            }
+        }
+    }
+
+    if (lazy_kill_weight_proc_enabled) {
+        if (killed_size) {
+            if (debug_process_killing) {
+                ALOGE("Find target kill app from default list: size=%zu", killed_size);
+            }
+        } else {
+            if (debug_process_killing) {
+                // Log all processes in weight lists before attempting any kills
+                for (int i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
+                    struct weightslot_list *head = &procweightslot_list[i];
+                    struct weightslot_list *curr = head->prev;
+                    struct proc *procp;
+
+                    ALOGI("Weight list[%d]", i);
+                    int j = 0;
+                    while (curr != head) {
+                        j++;
+                        procp = container_of(curr, struct proc, wsl);
+                        char buf[BUF_MAX];
+                        const char* proc_name = proc_get_name(procp->pid, buf, sizeof(buf));
+                        ALOGI("    %d : oomadj=%d, pid=%d, top-app=%s, process_name=%s",
+                            j, procp->oomadj, procp->pid,
+                            (procp->oomadj == 0 && proc_is_top_app(procp->pid)) ? "TRUE" : "FALSE",
+                            proc_name ? proc_name : "unknown");
+                        curr = curr->prev;
+                    }
+                }
+            }
+
+            bool process_killed = false;
+
+            for (int i = 0; i < WEIGHT_TO_SLOT_COUNT && !process_killed; i++) {
+                struct weightslot_list *head = &procweightslot_list[i];
+                struct weightslot_list *curr = head->prev;
+                struct proc *procp;
+
+                while (curr != head) {
+                    procp = container_of(curr, struct proc, wsl);
+                    struct weightslot_list *prev = curr->prev;
+
+                    // Kill weight processes (Weight 0->3), but SKIP foreground (top-app cpuset).
+                    // Skipped processes will be handled in last tier (Retry pass)
+                    if (lazy_kill_visible_proc_enabled && procp->oomadj == 0 &&
+                                proc_is_top_app(procp->pid)) {
+                        curr = prev;
+                        continue;
+                    }
+
+                    killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
+
+                    if (killed_size >= 0) {
+                        process_killed = true;
+
+                        if (debug_process_killing) {
+                            char buf[BUF_MAX];
+                            const char* proc_name = proc_get_name(procp->pid, buf, sizeof(buf));
+                            ALOGE("Find target kill app from weight list: "
+                                "name %s, weight: %d",
+                                proc_name, procp->weight);
+                        }
+                        break; // Exit inner while loop
+                    }
+                    curr = prev;
+                }
             }
         }
     }
@@ -4057,13 +4243,20 @@ update_watermarks:
         psi_parse_io(&psi_data);
         psi_parse_cpu(&psi_data);
         int pages_freed = 0;
-        if (lazy_killing_3rd_app_main_proc) {
-            lazy_kill_main_proc = true;
+        // Kill Tier:
+        // 1. Tier 4 (First): Ordinary Background Apps (Adj > 100)
+        //    - Handled by standard list in Pass 1.
+        // 2. Tier 3: Weighted Background Apps (Weight 0-3, Non top-app)
+        //    - Handled by weight list in Pass 1.
+        // 3. Tier 2: Ordinary Visible Apps (Adj <= 100)
+        //    - Handled by standard list in Pass 2 (Retry).
+        // 4. Tier 1 (Last): Weighted Foreground Apps (Weight 0-3, top-app)
+        //    - Handled by weight list in Pass 2 (Retry).
+        pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
+        if (pages_freed <= 0 && lazy_kill_weight_proc_enabled) {
+            lazy_kill_visible_proc_enabled = false;
             pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
-            lazy_kill_main_proc = false;
-        }
-        if (pages_freed <= 0) {
-            pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
+            lazy_kill_visible_proc_enabled = true;
         }
         if (pages_freed > 0) {
             killing = true;
@@ -4501,6 +4694,11 @@ static int init(void) {
     for (i = 0; i <= ADJTOSLOT(OOM_SCORE_ADJ_MAX); i++) {
         procadjslot_list[i].next = &procadjslot_list[i];
         procadjslot_list[i].prev = &procadjslot_list[i];
+    }
+
+    for (i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
+        procweightslot_list[i].next = &procweightslot_list[i];
+        procweightslot_list[i].prev = &procweightslot_list[i];
     }
 
     memset(killcnt_idx, KILLCNT_INVALID_IDX, sizeof(killcnt_idx));
@@ -4985,9 +5183,6 @@ static void update_perf_props() {
         snprintf(default_value, PROPERTY_VALUE_MAX, "%f", cache_percent);
         strlcpy(property, perf_get_prop("ro.lmk.cache_percent", default_value).value, PROPERTY_VALUE_MAX);
         cache_percent = (float)(strtod(property, NULL) * 0.01);
-
-        strlcpy(property, perf_get_prop("ro.lmk.lazy_killing_3rd_app_main_proc", "false").value, PROPERTY_VALUE_MAX);
-        lazy_killing_3rd_app_main_proc = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
 
         snprintf(default_value, PROPERTY_VALUE_MAX, "%lu", (total_available_threshold_kb));
         strlcpy(property, perf_get_prop("ro.lmk.total_available_threshold_kb", default_value).value,
