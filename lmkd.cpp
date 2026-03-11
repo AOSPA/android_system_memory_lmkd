@@ -679,7 +679,8 @@ static long page_k = -1;
 
 static void init_PreferredApps();
 static void update_perf_props();
-static void create_handle_for_perf_iop();
+static void create_handle_for_perf();
+static void create_handle_for_iop();
 static void close_handle_for_perf_iop();
 static void * handle_iopd = NULL;
 static void * handle_perfd = NULL;
@@ -4963,15 +4964,20 @@ static int on_boot_completed() {
     return res == BOOT_COMPLETED_NOTIF_SUCCESS ? 0 : -1;
 }
 
-static void create_handle_for_perf_iop() {
+static void create_handle_for_perf() {
     handle_perfd = dlopen(PERFD_LIB, RTLD_NOW);
+}
+
+static void create_handle_for_iop() {
     handle_iopd = dlopen(IOPD_LIB, RTLD_NOW);
 }
+
 
 static void close_handle_for_perf_iop() {
     if (handle_perfd != NULL) {
         dlclose(handle_perfd);
     }
+
     if (handle_iopd != NULL) {
         dlclose(handle_iopd);
     }
@@ -4980,6 +4986,7 @@ static void close_handle_for_perf_iop() {
 static void init_PreferredApps() {
     void *handle = NULL;
     if (!use_perf_api_for_pref_apps) {
+        create_handle_for_iop();
         if (handle_iopd != NULL) {
             perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle_iopd, "perf_ux_engine_trigger");
         }
@@ -5044,7 +5051,7 @@ static void update_perf_props() {
 
     /* Loading the vendor library at runtime to access property value */
     PropVal (*perf_get_prop)(const char *, const char *) = NULL;
-    create_handle_for_perf_iop();
+    create_handle_for_perf();
     if (handle_perfd != NULL) {
         perf_get_prop = (PropVal (*)(const char *, const char *))dlsym(handle_perfd, "perf_get_prop");
     }
