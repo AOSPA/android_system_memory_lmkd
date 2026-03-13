@@ -131,7 +131,7 @@ struct lmk_procprio {
 };
 #define LMK_PROCPRIO_SIZE (LMK_PROCPRIO_FIELD_COUNT * sizeof(int))
 
-#define LMK_PROCPRIO_FIELD_COUNT_EXT 5
+#define LMK_PROCPRIO_FIELD_COUNT_EXT 6
 #define LMK_PROCPRIO_SIZE_EXT (LMK_PROCPRIO_FIELD_COUNT_EXT * sizeof(int))
 
 /*
@@ -146,6 +146,7 @@ static inline void lmkd_pack_get_procprio_ext(LMKD_CTRL_PACKET packet, int field
     params->weight = ntohl(packet[4]);
     /* if field is missing assume PROC_TYPE_APP for backward compatibility */
     params->ptype = field_count > 4 ? (enum proc_type)ntohl(packet[5]) : PROC_TYPE_APP;
+    params->for_lmkd_only = field_count > 5 ? (bool)ntohl(packet[6]) : false;
 }
 
 /*
@@ -416,6 +417,7 @@ static inline int lmkd_pack_get_procs_prio_ext(LMKD_CTRL_PACKET packet, struct l
         params->procs[procs_idx].oomadj = ntohl(packet[packetIdx++]);
         params->procs[procs_idx].weight = ntohl(packet[packetIdx++]);
         params->procs[procs_idx].ptype = (enum proc_type)ntohl(packet[packetIdx++]);
+        params->procs[procs_idx].for_lmkd_only = (bool)ntohl(packet[packetIdx++]);
     }
 
     return procs_count;

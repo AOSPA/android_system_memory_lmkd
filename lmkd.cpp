@@ -653,7 +653,7 @@ static std::shared_mutex adjslot_list_lock;
 static struct adjslot_list procadjslot_list[ADJTOSLOT_COUNT];
 
 #define DEFAULT_PROC_WEIGHT   -1
-#define WEIGHT_TO_SLOT_COUNT   (3 + 1)
+#define WEIGHT_TO_SLOT_COUNT   3
 static struct weightslot_list procweightslot_list[WEIGHT_TO_SLOT_COUNT];
 
 #define container_of(ptr, type, member) \
@@ -1875,7 +1875,7 @@ static void ctrl_command_handler(int dsock_idx) {
     case LMK_PROCPRIO:
         /* process type field is optional for backward compatibility */
         if (lazy_kill_weight_proc_enabled) {
-            if (nargs < 4 || nargs > 5)
+            if (nargs < 4 || nargs > 6)
                 goto wronglen;
         } else {
             if (nargs < 3 || nargs > 5)
