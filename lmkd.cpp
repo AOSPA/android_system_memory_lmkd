@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <pwd.h>
 #include <sched.h>
@@ -42,7 +43,10 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <new>
+#include <optional>
 #include <shared_mutex>
+#include <variant>
 #include <vector>
 
 #include <BpfSyscallWrappers.h>
@@ -613,6 +617,7 @@ struct proc {
     struct weightslot_list wsl;
     int pid;
     int pidfd;
+    CgroupFD cgroupfd;
     uid_t uid;
     int oomadj;
     pid_t reg_pid; /* PID of the process that registered this record */
@@ -1178,7 +1183,8 @@ static int pid_remove(int pid) {
     }
 
     if (procp->pidfd != NATIVE_PID_FD) {
-        free(procp);
+        close(procp->cgroupfd);
+        delete procp;
     } else {
         memset(procp, 0, sizeof(struct proc));
     }
@@ -1519,11 +1525,20 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
             return;
         }
 
-        procp = static_cast<struct proc*>(calloc(1, sizeof(struct proc)));
+        procp = new (std::nothrow) struct proc();
         if (!procp) {
             // Oh, the irony.  May need to rebuild our state.
             close(pidfd);
             return;
+        }
+
+        if (auto [path, cgroupfd] = std::pair<std::string, int>();
+            CgroupGetAttributePathForProcess("CgroupKill", proc.uid, proc.pid, path) &&
+            (cgroupfd = open(path.c_str(), O_WRONLY | O_CLOEXEC)) >= 0) {
+            procp->cgroupfd = CgroupKillFD{cgroupfd};
+        } else if (CgroupGetAttributePathForProcess("CgroupProcs", proc.uid, proc.pid, path) &&
+            (cgroupfd = open(path.c_str(), O_RDONLY | O_CLOEXEC)) >= 0) {
+            procp->cgroupfd = CgroupProcsFD{cgroupfd}; // 5.10 kernels only
         }
 
         procp->pid = proc.pid;
@@ -2973,7 +2988,8 @@ static void watchdog_callback() {
             continue;
         }
 
-        if (target.valid && reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
+        if (target.valid &&
+            reaper.kill({ target.pidfd, target.cgroupfd, target.pid, target.uid }, true)) {
             ALOGW("lmkd watchdog killed process %d, oom_score_adj %d", target.pid, oom_score);
             killinfo_log(&target, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
             // Can't call pid_remove() from non-main thread, therefore just invalidate the record
@@ -3078,7 +3094,6 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int pidfd = procp->pidfd;
     uid_t uid = procp->uid;
     char *taskname;
-    int kill_result;
     int result = -1;
     struct memory_stat *mem_st;
     struct kill_stat kill_st;
@@ -3150,9 +3165,8 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
       return result;
     }
     start_wait_for_proc_kill(pidfd < 0 ? pid : pidfd);
-    kill_result = reaper.kill({ pidfd, pid, uid }, false);
 
-    if (kill_result) {
+    if (!reaper.kill({ pidfd, procp->cgroupfd, pid, uid }, false)) {
         stop_wait_for_proc_kill(false);
         ALOGE("kill(%d): errno=%d", pid, errno);
         /* Delete process record even when we fail to kill so that we don't get stuck on it */
@@ -4578,6 +4592,30 @@ static bool init_reaper() {
     return true;
 }
 
+static void expand_fd_table(unsigned short num_fds) {
+    if (num_fds == 0) return;
+
+    int target_fd = num_fds - 1;
+
+    if (fcntl(target_fd, F_GETFD) != -1) {
+        // No need to expand
+        return;
+    }
+
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd != -1) {
+        if (fd >= target_fd) {
+            close(fd);
+        } else {
+            dup2(fd, target_fd);
+            close(target_fd);
+            close(fd);
+        }
+    } else {
+        ALOGW("Could not expand fdtable to %d: %s", num_fds, strerror(errno));
+    }
+}
+
 static int init(void) {
     static struct event_handler_info kernel_poll_hinfo = { 0, kernel_event_handler };
     struct reread_data file_data = {
@@ -4592,6 +4630,10 @@ static int init(void) {
     if (page_k == -1)
         page_k = getpagesize();
     page_k /= 1024;
+
+    // Pre-expand the fdtable so we don't need to allocate when memory is low,
+    // which could trigger direct reclaim while we're trying to kill.
+    expand_fd_table(2048);
 
     epollfd = epoll_create(MAX_EPOLL_EVENTS);
     if (epollfd == -1) {
